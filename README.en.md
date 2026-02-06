@@ -65,6 +65,24 @@ Non-interactive setup example:
 python qwen3_asr_mlx_server.py setup --non-interactive --source huggingface
 ```
 
+Choose your preferred model variant (interactive setup):
+
+- During setup, enter your own `Repository id` (bf16 or quantized repo).
+- You can also choose a custom local directory.
+- The server loads the model files from the local directory you provide.
+
+Common repository examples (Hugging Face):
+
+- `mlx-community/Qwen3-ASR-1.7B-bf16`
+- `mlx-community/Qwen3-ASR-1.7B-4bit`
+- `mlx-community/Qwen3-ASR-1.7B-8bit`
+
+Download the Aligner proactively (word timestamps):
+
+- Run `python qwen3_asr_mlx_server.py setup` and choose `y` for `Qwen3-ForcedAligner-0.6B-bf16`.
+- You can run setup again later to download only the missing aligner.
+- Use `--source huggingface` or `--source modelscope` to select download source.
+
 ### 3) Run Server
 
 ```bash
@@ -84,6 +102,19 @@ Security note:
 - Default mode is localhost-only to avoid accidental exposure.
 - Only enable `0.0.0.0` when you need LAN clients.
 - If your machine has a public IP or port-forwarding enabled, do not expose this service directly to the Internet.
+
+Load your own local model directories:
+
+```bash
+QWEN_MLX_MODEL_PATH=/path/to/your/qwen3-asr-model \
+QWEN_MLX_ALIGNER_PATH=/path/to/your/qwen3-aligner-model \
+python qwen3_asr_mlx_server.py
+```
+
+Notes:
+
+- The request `model` field is used for compatibility and validation.
+- The actual loaded model is determined by `QWEN_MLX_MODEL_PATH`.
 
 ### 4) Quick Test
 

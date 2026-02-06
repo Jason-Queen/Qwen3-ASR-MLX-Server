@@ -65,6 +65,24 @@ python qwen3_asr_mlx_server.py setup
 python qwen3_asr_mlx_server.py setup --non-interactive --source huggingface
 ```
 
+自定义你想下载的模型（交互模式）：
+
+- 在 setup 过程中，按提示输入你自己的 `Repository id`（可填 bf16 或量化仓库）。
+- 同时可自定义本地目录（`Local directory`）。
+- 服务最终加载的是你指定目录里的模型文件。
+
+常见仓库示例（Hugging Face）：
+
+- `mlx-community/Qwen3-ASR-1.7B-bf16`
+- `mlx-community/Qwen3-ASR-1.7B-4bit`
+- `mlx-community/Qwen3-ASR-1.7B-8bit`
+
+主动下载 Aligner（词级时间戳）：
+
+- 交互模式：运行 `python qwen3_asr_mlx_server.py setup`，在 `Qwen3-ForcedAligner-0.6B-bf16` 提示处选择 `y`。
+- 你也可以单独再跑一次 setup，只下载缺失的 Aligner。
+- 可通过 `--source huggingface` 或 `--source modelscope` 指定下载源。
+
 ### 3）启动服务
 
 ```bash
@@ -84,6 +102,19 @@ QWEN_MLX_HOST=0.0.0.0 QWEN_MLX_PORT=8989 python qwen3_asr_mlx_server.py
 - 默认只监听本机，避免误暴露服务。
 - 只有在需要局域网接入时才开启 `0.0.0.0`。
 - 如果机器有公网 IP 或端口映射，请不要直接暴露该服务到公网。
+
+指定加载你自己的模型目录：
+
+```bash
+QWEN_MLX_MODEL_PATH=/path/to/your/qwen3-asr-model \
+QWEN_MLX_ALIGNER_PATH=/path/to/your/qwen3-aligner-model \
+python qwen3_asr_mlx_server.py
+```
+
+说明：
+
+- API 请求里的 `model` 字段用于兼容与校验；
+- 实际加载的模型由 `QWEN_MLX_MODEL_PATH` 决定。
 
 ### 4）快速测试
 
