@@ -34,7 +34,14 @@ If model files are missing, API requests fail with a clear setup hint. The servi
 
 ## Usage
 
-### 1) Install
+### 1) Clone the Repository
+
+```bash
+git clone https://github.com/Jason-Queen/Qwen3-ASR-MLX-Server.git
+cd Qwen3-ASR-MLX-Server
+```
+
+### 2) Install
 
 #### Conda
 
@@ -51,7 +58,7 @@ source .venv/bin/activate
 pip install -U -r requirements.txt
 ```
 
-### 2) Setup Models (required before transcription)
+### 3) Setup Models (required before transcription)
 
 Interactive setup (choose Hugging Face or ModelScope):
 
@@ -83,7 +90,7 @@ Download the Aligner proactively (word timestamps):
 - You can run setup again later to download only the missing aligner.
 - Use `--source huggingface` or `--source modelscope` to select download source.
 
-### 3) Run Server
+### 4) Run Server
 
 ```bash
 python qwen3_asr_mlx_server.py
@@ -116,7 +123,7 @@ Notes:
 - The request `model` field is used for compatibility and validation.
 - The actual loaded model is determined by `QWEN_MLX_MODEL_PATH`.
 
-### 4) Quick Test
+### 5) Quick Test
 
 ```bash
 curl -X POST 'http://127.0.0.1:8989/v1/audio/transcriptions' \
@@ -125,7 +132,7 @@ curl -X POST 'http://127.0.0.1:8989/v1/audio/transcriptions' \
   -F "response_format=json"
 ```
 
-### 5) Important Environment Variables
+### 6) Important Environment Variables
 
 ```bash
 QWEN_MLX_MODEL_PATH=./Qwen3-ASR-1.7B-bf16
