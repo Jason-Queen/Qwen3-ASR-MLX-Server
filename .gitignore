@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Runtime/logs/temp
+*.log
+logs/
+/tmp/
+
+# Local model weights (large)
+Qwen3-ASR-1.7B-bf16/
+Qwen3-ForcedAligner-0.6B-bf16/
+*.safetensors
+*.bin
+
+# Node (if added later)
+node_modules/
