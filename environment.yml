@@ -1,0 +1,14 @@
+name: qwen3-asr-whisper
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - fastapi>=0.110.0
+      - uvicorn[standard]>=0.30.0
+      - python-multipart>=0.0.9
+      - mlx-audio>=0.3.1
+      - modelscope>=1.18.0
+      - nagisa>=0.2.11
+      - soynlp>=0.0.493
