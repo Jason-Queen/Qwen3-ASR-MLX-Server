@@ -34,7 +34,14 @@
 
 ## 使用指南
 
-### 1）安装
+### 1）克隆仓库
+
+```bash
+git clone https://github.com/Jason-Queen/Qwen3-ASR-MLX-Server.git
+cd Qwen3-ASR-MLX-Server
+```
+
+### 2）安装
 
 #### Conda
 
@@ -51,7 +58,7 @@ source .venv/bin/activate
 pip install -U -r requirements.txt
 ```
 
-### 2）准备模型（转录前必做）
+### 3）准备模型（转录前必做）
 
 交互式 setup（可选择 Hugging Face 或 ModelScope）：
 
@@ -83,7 +90,7 @@ python qwen3_asr_mlx_server.py setup --non-interactive --source huggingface
 - 你也可以单独再跑一次 setup，只下载缺失的 Aligner。
 - 可通过 `--source huggingface` 或 `--source modelscope` 指定下载源。
 
-### 3）启动服务
+### 4）启动服务
 
 ```bash
 python qwen3_asr_mlx_server.py
@@ -116,7 +123,7 @@ python qwen3_asr_mlx_server.py
 - API 请求里的 `model` 字段用于兼容与校验；
 - 实际加载的模型由 `QWEN_MLX_MODEL_PATH` 决定。
 
-### 4）快速测试
+### 5）快速测试
 
 ```bash
 curl -X POST 'http://127.0.0.1:8989/v1/audio/transcriptions' \
@@ -125,7 +132,7 @@ curl -X POST 'http://127.0.0.1:8989/v1/audio/transcriptions' \
   -F "response_format=json"
 ```
 
-### 5）关键环境变量
+### 6）关键环境变量
 
 ```bash
 QWEN_MLX_MODEL_PATH=./Qwen3-ASR-1.7B-bf16
