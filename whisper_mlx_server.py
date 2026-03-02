@@ -58,6 +58,13 @@ AUTO_ALIGN_LANG_CODES = {
     for code in os.getenv("QWEN_MLX_AUTO_ALIGN_LANG_CODES", "zh,en,ja,ko").split(",")
     if code.strip()
 }
+SEGMENT_REBUILD_FROM_WORDS = (
+    os.getenv("QWEN_MLX_SEGMENT_REBUILD_FROM_WORDS", "1").strip().lower() not in {"0", "false", "no", "off"}
+)
+SEGMENT_MERGE_TARGET_SECONDS = float(os.getenv("QWEN_MLX_SEGMENT_MERGE_TARGET_SECONDS", "0"))
+SEGMENT_HARD_MAX_SECONDS = float(os.getenv("QWEN_MLX_SEGMENT_HARD_MAX_SECONDS", "12"))
+SEGMENT_PAUSE_THRESHOLD_SECONDS = float(os.getenv("QWEN_MLX_SEGMENT_PAUSE_THRESHOLD_SECONDS", "0.75"))
+SEGMENT_MAX_WORDS_PER_SEGMENT = int(os.getenv("QWEN_MLX_SEGMENT_MAX_WORDS_PER_SEGMENT", "28"))
 HOST = os.getenv("QWEN_MLX_HOST", "127.0.0.1")
 PORT = int(os.getenv("QWEN_MLX_PORT", "8989"))
 MAX_UPLOAD_MB = int(os.getenv("QWEN_MLX_MAX_UPLOAD_MB", "100"))
@@ -1031,18 +1038,40 @@ def _segment_text_for_chunks(
     result: TranscriptionResult,
     chunk_ranges: list[tuple[str, float, float]],
 ) -> list[str]:
-    chunk_texts: list[str] = []
-    for _chunk_path, start, end in chunk_ranges:
-        selected: list[str] = []
-        for segment in result.segments:
-            seg_text = str(segment.get("text", "")).strip()
-            if not seg_text:
-                continue
-            seg_start = _to_float(segment.get("start"), 0.0)
-            seg_end = _to_float(segment.get("end"), seg_start)
-            if seg_end > start and seg_start < end:
-                selected.append(seg_text)
-        chunk_texts.append(" ".join(selected).strip())
+    # Assign each coarse ASR segment to exactly one alignment chunk to avoid
+    # duplicated text across neighboring chunks (which can produce overlapping
+    # word timestamps after chunk offset stitching).
+    assigned: list[list[str]] = [[] for _ in chunk_ranges]
+    for segment in result.segments:
+        seg_text = str(segment.get("text", "")).strip()
+        if not seg_text:
+            continue
+        seg_start = _to_float(segment.get("start"), 0.0)
+        seg_end = _to_float(segment.get("end"), seg_start)
+        if seg_end < seg_start:
+            seg_end = seg_start
+
+        best_idx = -1
+        best_overlap = -1.0
+        seg_mid = (seg_start + seg_end) / 2.0
+
+        for idx, (_chunk_path, chunk_start, chunk_end) in enumerate(chunk_ranges):
+            overlap = max(0.0, min(seg_end, chunk_end) - max(seg_start, chunk_start))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_idx = idx
+            elif overlap == best_overlap and best_idx >= 0:
+                # Tie-breaker: prefer the chunk containing segment midpoint.
+                in_best = chunk_ranges[best_idx][1] <= seg_mid < chunk_ranges[best_idx][2]
+                in_curr = chunk_start <= seg_mid < chunk_end
+                if in_curr and not in_best:
+                    best_idx = idx
+
+        if best_idx < 0:
+            continue
+        assigned[best_idx].append(seg_text)
+
+    chunk_texts: list[str] = [" ".join(items).strip() for items in assigned]
 
     non_empty = [text for text in chunk_texts if text]
     repeated_full_text = (
@@ -1121,22 +1150,53 @@ def _apply_alignment(
     try:
         chunk_texts = _segment_text_for_chunks(result, chunk_specs)
         aligned_words: list[dict[str, Any]] = []
-        for (chunk_path, chunk_start, _), chunk_text in zip(chunk_specs, chunk_texts):
+        for (chunk_path, chunk_start, chunk_end), chunk_text in zip(chunk_specs, chunk_texts):
             if not chunk_text.strip():
                 continue
+            chunk_duration = max(0.0, float(chunk_end) - float(chunk_start))
             words = aligner.align(
                 audio=chunk_path,
                 text=chunk_text,
                 language=aligner_language,
             )
             for word in words:
+                local_start = _to_float(word.get("start"), 0.0)
+                local_end = _to_float(word.get("end"), local_start)
+                if local_end < local_start:
+                    local_end = local_start
+
+                # Keep each aligned token inside the audio chunk boundary so
+                # chunk stitching cannot drift later than the real timeline.
+                if chunk_duration > 0.0:
+                    local_start = max(0.0, min(local_start, chunk_duration))
+                    local_end = max(local_start, min(local_end, chunk_duration))
+                else:
+                    local_start = 0.0
+                    local_end = 0.0
+
                 aligned_words.append(
                     {
-                        "word": word["word"],
-                        "start": word["start"] + chunk_start,
-                        "end": word["end"] + chunk_start,
+                        "word": str(word.get("word", "")),
+                        "start": local_start + chunk_start,
+                        "end": local_end + chunk_start,
                     }
                 )
+        if duration_sec and duration_sec > 0.0:
+            clamped: list[dict[str, Any]] = []
+            for word in aligned_words:
+                start = _to_float(word.get("start"), 0.0)
+                end = _to_float(word.get("end"), start)
+                start = max(0.0, min(start, duration_sec))
+                end = max(start, min(end, duration_sec))
+                item = {"word": str(word.get("word", "")), "start": start, "end": end}
+                clamped.append(item)
+            aligned_words = clamped
+        aligned_words.sort(
+            key=lambda item: (
+                _to_float(item.get("start"), 0.0),
+                _to_float(item.get("end"), 0.0),
+            )
+        )
         return aligned_words
     finally:
         for chunk_path in chunk_paths:
@@ -1626,6 +1686,42 @@ def _build_pause_segments_from_words(
 
     flush_chunk()
     return segments
+
+
+def _rebuild_segments_from_words(
+    *,
+    words: list[dict[str, Any]],
+    text: str,
+    lang_code: str | None,
+) -> list[dict[str, Any]]:
+    if not words:
+        return []
+
+    rebuilt = _build_sentence_segments_from_words(words, text, lang_code)
+    if not rebuilt:
+        rebuilt = _build_pause_segments_from_words(
+            words,
+            lang_code,
+            pause_threshold_sec=SEGMENT_PAUSE_THRESHOLD_SECONDS,
+            max_words_per_segment=max(1, SEGMENT_MAX_WORDS_PER_SEGMENT),
+        )
+    if not rebuilt:
+        return []
+
+    if SEGMENT_MERGE_TARGET_SECONDS > 0.0:
+        rebuilt = _merge_segments_by_target_duration(
+            rebuilt,
+            lang_code,
+            target_seconds=SEGMENT_MERGE_TARGET_SECONDS,
+        )
+    if SEGMENT_HARD_MAX_SECONDS > 0.0:
+        rebuilt = _enforce_hard_duration_limit(
+            rebuilt,
+            lang_code,
+            hard_max_seconds=SEGMENT_HARD_MAX_SECONDS,
+        )
+
+    return _normalize_segments(rebuilt)
 
 
 def _to_float(value: Any, default: float) -> float:
@@ -2371,6 +2467,19 @@ async def _run_transcription_pipeline(
                     )
                 else:
                     result.words = aligned_words
+                    if SEGMENT_REBUILD_FROM_WORDS and aligned_words:
+                        rebuilt_segments = _rebuild_segments_from_words(
+                            words=aligned_words,
+                            text=result.text,
+                            lang_code=detected_language_code,
+                        )
+                        if rebuilt_segments:
+                            result.segments = rebuilt_segments
+                            logger.info(
+                                "[%s] sentence_segments=on segments_rebuilt=%d",
+                                request_id,
+                                len(result.segments),
+                            )
                     logger.info(
                         "[%s] forced_alignment=%s words=%d segments=%d lang=%s duration=%.2fs",
                         request_id,
@@ -2443,7 +2552,7 @@ async def _run_transcription_pipeline(
 
 transcriber = MLXTranscriber(model_path=MODEL_PATH)
 aligner = MLXAligner(model_path=ALIGNER_PATH)
-app = FastAPI(title="Qwen3-ASR-MLX-Server", version="1.0.0")
+app = FastAPI(title="Qwen3-ASR-MLX-Server", version="1.0.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -2559,12 +2668,20 @@ async def transcriptions(
     audio_bytes = b""
     file_name = "audio.wav"
     content_type = request.headers.get("content-type", "")
+    user_agent = request.headers.get("user-agent", "") or "unknown"
+    client_host = request.client.host if request.client else "unknown"
 
     logger.info(
         "[%s] POST /v1/audio/transcriptions content_type=%s content_length=%s",
         request_id,
         content_type,
         request.headers.get("content-length", "unknown"),
+    )
+    logger.info(
+        "[%s] request_meta client=%s user_agent=%s",
+        request_id,
+        client_host,
+        user_agent,
     )
 
     if file is not None:
@@ -2623,6 +2740,19 @@ async def transcriptions(
             detail="Missing required form field: file",
         )
 
+    logger.info(
+        "[%s] request_params model=%s language=%s response_format=%s alignment_mode=%s "
+        "timestamp_granularities=%s file_name=%s decoded_bytes=%d",
+        request_id,
+        requested_model_name,
+        language or "auto",
+        response_format,
+        alignment_mode,
+        ",".join(timestamp_granularities) if timestamp_granularities else "none",
+        file_name,
+        len(audio_bytes),
+    )
+
     _ensure_transcriber_ready_or_raise(requested_model_name)
 
     result = await _run_transcription_pipeline(
@@ -2647,6 +2777,8 @@ async def chat_completions(request: Request) -> Response:
 
     payload = await request.json()
     request_id = uuid.uuid4().hex[:8]
+    user_agent = request.headers.get("user-agent", "") or "unknown"
+    client_host = request.client.host if request.client else "unknown"
 
     _validate_task(payload.get("task"))
     model = _normalize_requested_model_name(payload.get("model"))
@@ -2681,6 +2813,20 @@ async def chat_completions(request: Request) -> Response:
         )
     if not prompt:
         prompt = chat_prompt
+
+    logger.info(
+        "[%s] POST /v1/chat/completions client=%s user_agent=%s model=%s language=%s "
+        "alignment_mode=%s timestamp_granularities=%s file_name=%s decoded_bytes=%d",
+        request_id,
+        client_host,
+        user_agent,
+        model,
+        language or "auto",
+        alignment_mode,
+        ",".join(timestamp_granularities) if timestamp_granularities else "none",
+        file_name,
+        len(audio_bytes),
+    )
 
     result = await _run_transcription_pipeline(
         request_id=request_id,
