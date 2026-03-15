@@ -203,7 +203,9 @@ class MLXTranscriber:
             self._load_error = "mlx-audio import failed"
             if strict:
                 raise RuntimeError(
-                    "mlx-audio import failed. Please install dependencies first."
+                    "mlx-audio import failed. Install project dependencies first "
+                    "(recommended: uv sync --python 3.11; alternatives: pip install -r "
+                    "requirements.txt or conda env create -f environment.yml)."
                 ) from IMPORT_ERROR
             return
 
@@ -307,7 +309,9 @@ class MLXAligner:
             self._load_error = "mlx-audio import failed"
             if strict:
                 raise RuntimeError(
-                    "mlx-audio import failed. Please install dependencies first."
+                    "mlx-audio import failed. Install project dependencies first "
+                    "(recommended: uv sync --python 3.11; alternatives: pip install -r "
+                    "requirements.txt or conda env create -f environment.yml)."
                 ) from IMPORT_ERROR
             return
 
@@ -459,7 +463,9 @@ def _download_from_modelscope(repo_id: str, local_path: str) -> None:
         from modelscope.hub.snapshot_download import snapshot_download as ms_snapshot_download
     except Exception as exc:
         raise RuntimeError(
-            "ModelScope downloader is unavailable. Install it first: pip install modelscope"
+            "ModelScope downloader is unavailable. Install project dependencies first "
+            "(recommended: uv sync --python 3.11; alternatives: pip install -r requirements.txt "
+            "or conda env create -f environment.yml)."
         ) from exc
 
     target = Path(local_path)

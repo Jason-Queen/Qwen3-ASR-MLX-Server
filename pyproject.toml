@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen3-asr-mlx-server"
+version = "1.0.1"
+description = "A local FastAPI server for Qwen3-ASR (MLX) with Whisper-compatible endpoints."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = "Apache-2.0"
+dependencies = [
+  "fastapi>=0.110.0",
+  "uvicorn[standard]>=0.30.0",
+  "python-multipart>=0.0.9",
+  "mlx-audio>=0.3.1",
+  "modelscope>=1.18.0",
+  "nagisa>=0.2.11",
+  "soynlp>=0.0.493",
+]
+
+[project.scripts]
+qwen3-asr-mlx-server = "qwen3_asr_mlx_server:main"
+
+[tool.setuptools]
+py-modules = ["qwen3_asr_mlx_server", "whisper_mlx_server"]
