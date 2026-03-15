@@ -43,14 +43,27 @@ cd Qwen3-ASR-MLX-Server
 
 ### 2）安装
 
-#### Conda
+#### 默认：uv
+
+```bash
+uv sync --python 3.11
+```
+
+如果你还没有 Python 3.11，可先执行：
+
+```bash
+uv python install 3.11
+uv sync --python 3.11
+```
+
+#### 兼容方式：Conda
 
 ```bash
 conda env create -f environment.yml
 conda activate qwen3-asr-whisper
 ```
 
-#### venv
+#### 兼容方式：venv / pip
 
 ```bash
 python3 -m venv .venv
@@ -63,13 +76,13 @@ pip install -U -r requirements.txt
 交互式 setup（可选择 Hugging Face 或 ModelScope）：
 
 ```bash
-python qwen3_asr_mlx_server.py setup
+uv run --python 3.11 qwen3_asr_mlx_server.py setup
 ```
 
 非交互示例：
 
 ```bash
-python qwen3_asr_mlx_server.py setup --non-interactive --source huggingface
+uv run --python 3.11 qwen3_asr_mlx_server.py setup --non-interactive --source huggingface
 ```
 
 自定义你想下载的模型（交互模式）：
@@ -86,14 +99,14 @@ python qwen3_asr_mlx_server.py setup --non-interactive --source huggingface
 
 主动下载 Aligner（词级时间戳）：
 
-- 交互模式：运行 `python qwen3_asr_mlx_server.py setup`，在 `Qwen3-ForcedAligner-0.6B-bf16` 提示处选择 `y`。
+- 交互模式：运行 `uv run --python 3.11 qwen3_asr_mlx_server.py setup`，在 `Qwen3-ForcedAligner-0.6B-bf16` 提示处选择 `y`。
 - 你也可以单独再跑一次 setup，只下载缺失的 Aligner。
 - 可通过 `--source huggingface` 或 `--source modelscope` 指定下载源。
 
 ### 4）启动服务
 
 ```bash
-python qwen3_asr_mlx_server.py
+uv run --python 3.11 qwen3-asr-mlx-server
 ```
 
 默认监听：`127.0.0.1:8989`
@@ -101,7 +114,7 @@ python qwen3_asr_mlx_server.py
 局域网模式（显式开启）：
 
 ```bash
-QWEN_MLX_HOST=0.0.0.0 QWEN_MLX_PORT=8989 python qwen3_asr_mlx_server.py
+QWEN_MLX_HOST=0.0.0.0 QWEN_MLX_PORT=8989 uv run --python 3.11 qwen3-asr-mlx-server
 ```
 
 安全提示：
@@ -115,6 +128,12 @@ QWEN_MLX_HOST=0.0.0.0 QWEN_MLX_PORT=8989 python qwen3_asr_mlx_server.py
 ```bash
 QWEN_MLX_MODEL_PATH=/path/to/your/qwen3-asr-model \
 QWEN_MLX_ALIGNER_PATH=/path/to/your/qwen3-aligner-model \
+uv run --python 3.11 qwen3-asr-mlx-server
+```
+
+如果你使用 Conda 或 `venv`，现有启动命令仍然兼容：
+
+```bash
 python qwen3_asr_mlx_server.py
 ```
 

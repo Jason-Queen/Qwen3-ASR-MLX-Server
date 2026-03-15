@@ -43,14 +43,27 @@ cd Qwen3-ASR-MLX-Server
 
 ### 2) Install
 
-#### Conda
+#### Default: uv
+
+```bash
+uv sync --python 3.11
+```
+
+If Python 3.11 is not installed yet, run:
+
+```bash
+uv python install 3.11
+uv sync --python 3.11
+```
+
+#### Compatible: Conda
 
 ```bash
 conda env create -f environment.yml
 conda activate qwen3-asr-whisper
 ```
 
-#### venv
+#### Compatible: venv / pip
 
 ```bash
 python3 -m venv .venv
@@ -63,13 +76,13 @@ pip install -U -r requirements.txt
 Interactive setup (choose Hugging Face or ModelScope):
 
 ```bash
-python qwen3_asr_mlx_server.py setup
+uv run --python 3.11 qwen3_asr_mlx_server.py setup
 ```
 
 Non-interactive setup example:
 
 ```bash
-python qwen3_asr_mlx_server.py setup --non-interactive --source huggingface
+uv run --python 3.11 qwen3_asr_mlx_server.py setup --non-interactive --source huggingface
 ```
 
 Choose your preferred model variant (interactive setup):
@@ -86,14 +99,14 @@ Common repository examples (Hugging Face):
 
 Download the Aligner proactively (word timestamps):
 
-- Run `python qwen3_asr_mlx_server.py setup` and choose `y` for `Qwen3-ForcedAligner-0.6B-bf16`.
+- Run `uv run --python 3.11 qwen3_asr_mlx_server.py setup` and choose `y` for `Qwen3-ForcedAligner-0.6B-bf16`.
 - You can run setup again later to download only the missing aligner.
 - Use `--source huggingface` or `--source modelscope` to select download source.
 
 ### 4) Run Server
 
 ```bash
-python qwen3_asr_mlx_server.py
+uv run --python 3.11 qwen3-asr-mlx-server
 ```
 
 Default bind: `127.0.0.1:8989`
@@ -101,7 +114,7 @@ Default bind: `127.0.0.1:8989`
 LAN mode (explicit opt-in):
 
 ```bash
-QWEN_MLX_HOST=0.0.0.0 QWEN_MLX_PORT=8989 python qwen3_asr_mlx_server.py
+QWEN_MLX_HOST=0.0.0.0 QWEN_MLX_PORT=8989 uv run --python 3.11 qwen3-asr-mlx-server
 ```
 
 Security note:
@@ -115,6 +128,12 @@ Load your own local model directories:
 ```bash
 QWEN_MLX_MODEL_PATH=/path/to/your/qwen3-asr-model \
 QWEN_MLX_ALIGNER_PATH=/path/to/your/qwen3-aligner-model \
+uv run --python 3.11 qwen3-asr-mlx-server
+```
+
+If you use Conda or a `venv`, the existing startup command remains compatible:
+
+```bash
 python qwen3_asr_mlx_server.py
 ```
 
