@@ -143,6 +143,13 @@ QWEN_MLX_PORT=8989
 QWEN_MLX_MAX_UPLOAD_MB=100
 QWEN_MLX_ALIGNMENT_CHUNK_SECONDS=30
 QWEN_MLX_AUTO_ALIGN_LANG_CODES=zh,en,ja,ko
+QWEN_MLX_LOG_PROMPTS=0
+```
+
+Set `QWEN_MLX_LOG_PROMPTS=1` to explicitly enable request prompt preview logging; it is disabled by default. You can also enable it with a startup flag:
+
+```bash
+python qwen3_asr_mlx_server.py --log-prompts
 ```
 
 Chunk size tuning guidance:

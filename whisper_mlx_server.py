@@ -70,6 +70,15 @@ PORT = int(os.getenv("QWEN_MLX_PORT", "8989"))
 MAX_UPLOAD_MB = int(os.getenv("QWEN_MLX_MAX_UPLOAD_MB", "100"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 LOG_LEVEL = os.getenv("QWEN_MLX_LOG_LEVEL", "INFO").upper()
+LOG_PROMPTS = os.getenv("QWEN_MLX_LOG_PROMPTS", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+    "enable",
+    "enabled",
+}
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -755,6 +764,38 @@ def _as_optional_str(value: Any) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def _prompt_log_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _preview_text(value: Any, max_chars: int = 120) -> str:
+    text = _prompt_log_text(value)
+    if not text:
+        return "none"
+    compact = " ".join(text.split())
+    if not compact:
+        return "none"
+    if len(compact) <= max_chars:
+        return compact
+    return f"{compact[:max_chars]}..."
+
+
+def _log_prompt_preview(request_id: str, prompt: Any) -> None:
+    if not LOG_PROMPTS:
+        return
+    prompt_text = _prompt_log_text(prompt)
+    logger.info(
+        "[%s] request_prompt prompt_len=%d prompt_preview=%s",
+        request_id,
+        len(prompt_text or ""),
+        _preview_text(prompt_text),
+    )
 
 
 def _normalize_segments(raw_segments: Any) -> list[dict[str, Any]]:
@@ -2752,6 +2793,7 @@ async def transcriptions(
         file_name,
         len(audio_bytes),
     )
+    _log_prompt_preview(request_id, prompt)
 
     _ensure_transcriber_ready_or_raise(requested_model_name)
 
@@ -2827,6 +2869,7 @@ async def chat_completions(request: Request) -> Response:
         file_name,
         len(audio_bytes),
     )
+    _log_prompt_preview(request_id, prompt)
 
     result = await _run_transcription_pipeline(
         request_id=request_id,
@@ -2851,6 +2894,8 @@ async def chat_completions(request: Request) -> Response:
 def main() -> None:
     import uvicorn
 
+    global LOG_PROMPTS
+
     parser = argparse.ArgumentParser(description="Qwen3-ASR-MLX-Server")
     parser.add_argument(
         "command",
@@ -2870,10 +2915,23 @@ def main() -> None:
         action="store_true",
         help="Setup mode: download all missing models with defaults",
     )
+    parser.add_argument(
+        "--log-prompts",
+        action="store_true",
+        help="Serve mode: log request prompt previews at INFO level (disabled by default)",
+    )
     args = parser.parse_args()
 
     if args.command == "setup":
         raise SystemExit(run_setup_wizard(source=args.source, non_interactive=args.non_interactive))
+
+    if args.log_prompts:
+        LOG_PROMPTS = True
+
+    if LOG_PROMPTS:
+        logger.warning(
+            "Prompt logging is enabled; request prompt previews will be written to INFO logs"
+        )
 
     maybe_prompt_initial_setup()
     uvicorn.run(app, host=HOST, port=PORT)
