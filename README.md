@@ -143,6 +143,13 @@ QWEN_MLX_PORT=8989
 QWEN_MLX_MAX_UPLOAD_MB=100
 QWEN_MLX_ALIGNMENT_CHUNK_SECONDS=30
 QWEN_MLX_AUTO_ALIGN_LANG_CODES=zh,en,ja,ko
+QWEN_MLX_LOG_PROMPTS=0
+```
+
+其中 `QWEN_MLX_LOG_PROMPTS=1` 会显式开启请求 prompt 预览日志，默认关闭；也可以用启动参数：
+
+```bash
+python qwen3_asr_mlx_server.py --log-prompts
 ```
 
 分片时长调优建议：
