@@ -168,7 +168,7 @@ QWEN_MLX_LOG_PROMPTS=0
 其中 `QWEN_MLX_LOG_PROMPTS=1` 会显式开启请求 prompt 预览日志，默认关闭；也可以用启动参数：
 
 ```bash
-python qwen3_asr_mlx_server.py --log-prompts
+uv run --python 3.11 qwen3-asr-mlx-server --log-prompts
 ```
 
 分片时长调优建议：

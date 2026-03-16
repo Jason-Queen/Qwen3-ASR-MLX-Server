@@ -168,7 +168,7 @@ QWEN_MLX_LOG_PROMPTS=0
 Set `QWEN_MLX_LOG_PROMPTS=1` to explicitly enable request prompt preview logging; it is disabled by default. You can also enable it with a startup flag:
 
 ```bash
-python qwen3_asr_mlx_server.py --log-prompts
+uv run --python 3.11 qwen3-asr-mlx-server --log-prompts
 ```
 
 Chunk size tuning guidance:
