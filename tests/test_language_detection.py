@@ -7,6 +7,7 @@ from whisper_mlx_server import TranscriptionResult
 from whisper_mlx_server import _build_transcription_response
 from whisper_mlx_server import _finalize_result_language
 from whisper_mlx_server import _normalize_result
+from whisper_mlx_server import _restore_segment_languages_from_overlap
 
 
 class LanguageDetectionTests(unittest.TestCase):
@@ -104,6 +105,36 @@ class LanguageDetectionTests(unittest.TestCase):
 
         self.assertNotIn("language", payload["segments"][0])
         self.assertEqual(payload["detected_languages"], [{"code": "en", "duration": 2.0}])
+
+    def test_restore_segment_languages_from_overlap_uses_dominant_source_language(self) -> None:
+        source_segments = [
+            {"id": 0, "start": 0.0, "end": 2.0, "text": "Hello", "language": "en"},
+            {"id": 1, "start": 2.0, "end": 5.0, "text": "你好世界", "language": "zh"},
+            {"id": 2, "start": 5.0, "end": 8.0, "text": "早晨", "language": "yue"},
+        ]
+        rebuilt_segments = [
+            {"id": 0, "start": 0.0, "end": 1.0, "text": "Hello"},
+            {"id": 1, "start": 1.0, "end": 3.0, "text": "Hello 你好"},
+            {"id": 2, "start": 3.0, "end": 6.0, "text": "世界 早晨"},
+            {"id": 3, "start": 6.0, "end": 8.0, "text": "早晨"},
+        ]
+
+        restored = _restore_segment_languages_from_overlap(source_segments, rebuilt_segments)
+
+        self.assertEqual([segment.get("language") for segment in restored], ["en", "en", "zh", "yue"])
+
+    def test_restore_segment_languages_from_overlap_keeps_existing_language(self) -> None:
+        source_segments = [
+            {"id": 0, "start": 0.0, "end": 2.0, "text": "Hello", "language": "en"},
+            {"id": 1, "start": 2.0, "end": 4.0, "text": "你好", "language": "zh"},
+        ]
+        rebuilt_segments = [
+            {"id": 0, "start": 0.0, "end": 4.0, "text": "Hello 你好", "language": "yue"},
+        ]
+
+        restored = _restore_segment_languages_from_overlap(source_segments, rebuilt_segments)
+
+        self.assertEqual(restored[0]["language"], "yue")
 
 
 if __name__ == "__main__":
