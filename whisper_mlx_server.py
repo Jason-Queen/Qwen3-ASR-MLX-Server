@@ -1024,38 +1024,6 @@ def _select_primary_language_code(codes: list[str]) -> str | None:
     return max(codes, key=lambda code: (counts[code], -first_index[code]))
 
 
-def _prompt_log_text(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    return str(value)
-
-
-def _preview_text(value: Any, max_chars: int = 120) -> str:
-    text = _prompt_log_text(value)
-    if not text:
-        return "none"
-    compact = " ".join(text.split())
-    if not compact:
-        return "none"
-    if len(compact) <= max_chars:
-        return compact
-    return f"{compact[:max_chars]}..."
-
-
-def _log_prompt_preview(request_id: str, prompt: Any) -> None:
-    if not LOG_PROMPTS:
-        return
-    prompt_text = _prompt_log_text(prompt)
-    logger.info(
-        "[%s] request_prompt prompt_len=%d prompt_preview=%s",
-        request_id,
-        len(prompt_text or ""),
-        _preview_text(prompt_text),
-    )
-
-
 def _normalize_segments(raw_segments: Any) -> list[dict[str, Any]]:
     if not isinstance(raw_segments, (list, tuple)):
         return []
