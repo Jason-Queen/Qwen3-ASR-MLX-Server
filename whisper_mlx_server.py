@@ -120,6 +120,65 @@ def _candidate_asset_dirs(
     return candidates
 
 
+def _is_nonempty_file(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _asset_dir_validation_error(path: Path) -> str | None:
+    if not path.exists():
+        return "path does not exist"
+    if not path.is_dir():
+        return "path is not a directory"
+
+    missing_metadata = [
+        name
+        for name in ("config.json", "tokenizer_config.json", "preprocessor_config.json")
+        if not _is_nonempty_file(path / name)
+    ]
+    if missing_metadata:
+        return f"missing required files: {', '.join(missing_metadata)}"
+
+    index_path = path / "model.safetensors.index.json"
+    if index_path.exists():
+        if not _is_nonempty_file(index_path):
+            return "model.safetensors.index.json is empty or unreadable"
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "model.safetensors.index.json is invalid"
+
+        weight_map = payload.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            return "model.safetensors.index.json has no weight_map entries"
+
+        missing_shards = sorted(
+            {
+                shard_name
+                for shard_name in (
+                    str(candidate).strip() for candidate in weight_map.values()
+                )
+                if shard_name and not _is_nonempty_file(path / shard_name)
+            }
+        )
+        if missing_shards:
+            preview = ", ".join(missing_shards[:3])
+            if len(missing_shards) > 3:
+                preview = f"{preview}, ..."
+            return f"missing model weight files: {preview}"
+        return None
+
+    if any(_is_nonempty_file(candidate) for candidate in path.glob("*.safetensors")):
+        return None
+    return "missing model weight files (*.safetensors)"
+
+
+def _is_usable_asset_dir(path: Path) -> bool:
+    return _asset_dir_validation_error(path) is None
+
+
 def _default_asset_path(
     dirname: str,
     *,
@@ -127,7 +186,7 @@ def _default_asset_path(
     base_dir: Path | None = None,
 ) -> str:
     for path in _candidate_asset_dirs(dirname, hf_repo=hf_repo, base_dir=base_dir):
-        if path.exists():
+        if _is_usable_asset_dir(path):
             return str(path)
 
     workspace_root = _workspace_root(base_dir)
@@ -309,8 +368,11 @@ class MLXTranscriber:
         with self._load_lock:
             if self._model is None:
                 model_dir = Path(self.model_path)
-                if not model_dir.exists():
-                    self._load_error = f"model path does not exist: {self.model_path}"
+                validation_error = _asset_dir_validation_error(model_dir)
+                if validation_error is not None:
+                    self._load_error = (
+                        f"invalid model directory '{self.model_path}': {validation_error}"
+                    )
                     if strict:
                         raise FileNotFoundError(self._load_error)
                     return
@@ -327,7 +389,7 @@ class MLXTranscriber:
         return self._model is not None
 
     def is_available(self) -> bool:
-        return Path(self.model_path).exists()
+        return _is_usable_asset_dir(Path(self.model_path))
 
     def last_error(self) -> str | None:
         return self._load_error
@@ -416,8 +478,11 @@ class MLXAligner:
             if self._model is not None:
                 return
             model_dir = Path(self.model_path)
-            if not model_dir.exists():
-                self._load_error = f"aligner model path does not exist: {self.model_path}"
+            validation_error = _asset_dir_validation_error(model_dir)
+            if validation_error is not None:
+                self._load_error = (
+                    f"invalid aligner model directory '{self.model_path}': {validation_error}"
+                )
                 if strict:
                     raise FileNotFoundError(self._load_error)
                 return
@@ -507,7 +572,7 @@ def _is_interactive_terminal() -> bool:
 def _missing_setup_models() -> list[SetupModelSpec]:
     missing: list[SetupModelSpec] = []
     for spec in SETUP_MODEL_SPECS:
-        if not Path(spec.local_path).exists():
+        if not _is_usable_asset_dir(Path(spec.local_path)):
             missing.append(spec)
     return missing
 
@@ -678,12 +743,14 @@ def run_setup_wizard(
 
 
 def maybe_prompt_initial_setup() -> None:
-    if Path(MODEL_PATH).exists():
+    validation_error = _asset_dir_validation_error(Path(MODEL_PATH))
+    if validation_error is None:
         return
 
     logger.warning(
-        "ASR model missing at %s. %s",
+        "ASR model unavailable at %s: %s. %s",
         MODEL_PATH,
+        validation_error,
         _manual_model_setup_help("QWEN_MLX_MODEL_PATH"),
     )
     if not _is_interactive_terminal():
@@ -691,6 +758,7 @@ def maybe_prompt_initial_setup() -> None:
     print(
         "\nQwen3 ASR model is not available.\n"
         f"Resolved path: {MODEL_PATH}\n"
+        f"Reason: {validation_error}\n"
         "The server checks the Hugging Face cache first, then repo/workspace-local model directories.\n"
         f"{_manual_model_setup_help('QWEN_MLX_MODEL_PATH')}\n"
         "Automatic download during normal serving is disabled.\n"
@@ -757,13 +825,17 @@ def _validate_supported_model_name(model_name: Any) -> str:
 def _ensure_transcriber_ready_or_raise(requested_model: Any) -> str:
     canonical_model = _validate_supported_model_name(requested_model)
     if not transcriber.is_available():
+        validation_error = _asset_dir_validation_error(Path(MODEL_PATH))
+        detail = (
+            f"Model files are missing or incomplete at '{MODEL_PATH}'. "
+            "Automatic download is disabled. "
+        )
+        if validation_error:
+            detail += f"reason={validation_error}. "
+        detail += _manual_model_setup_help("QWEN_MLX_MODEL_PATH")
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Model files are missing at '{MODEL_PATH}'. "
-                "Automatic download is disabled. "
-                f"{_manual_model_setup_help('QWEN_MLX_MODEL_PATH')}"
-            ),
+            detail=detail,
         )
     if not transcriber.is_ready():
         raise HTTPException(
