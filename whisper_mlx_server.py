@@ -1057,6 +1057,47 @@ def _resolve_primary_language_from_segments(segments: list[dict[str, Any]]) -> s
     )
 
 
+def _summarize_detected_languages(result: TranscriptionResult) -> list[dict[str, Any]]:
+    stats: dict[str, dict[str, float | int]] = {}
+    for index, segment in enumerate(result.segments):
+        code = _to_language_code(str(segment.get("language", "")).strip())
+        if not code:
+            continue
+
+        start = _to_float(segment.get("start"), 0.0)
+        end = _to_float(segment.get("end"), start)
+        duration = max(end - start, 0.0)
+        bucket = stats.setdefault(
+            code,
+            {"duration": 0.0, "count": 0, "first_index": index},
+        )
+        bucket["duration"] = float(bucket["duration"]) + duration
+        bucket["count"] = int(bucket["count"]) + 1
+
+    if not stats:
+        fallback_code = _to_language_code(result.language)
+        if not fallback_code:
+            return []
+        fallback_duration = max(_to_float(result.duration, 0.0), 0.0)
+        return [{"code": fallback_code, "duration": round(fallback_duration, 3)}]
+
+    ordered_codes = sorted(
+        stats,
+        key=lambda code: (
+            -float(stats[code]["duration"]),
+            -int(stats[code]["count"]),
+            int(stats[code]["first_index"]),
+        ),
+    )
+    return [
+        {
+            "code": code,
+            "duration": round(float(stats[code]["duration"]), 3),
+        }
+        for code in ordered_codes
+    ]
+
+
 def _normalize_word_segments(raw: Any) -> list[dict[str, Any]]:
     raw_segments: Any = None
     if hasattr(raw, "segments"):
@@ -2054,6 +2095,7 @@ def _build_transcription_response(result: TranscriptionResult, response_format: 
         return PlainTextResponse(content=result.text)
 
     if response_format == "verbose_json":
+        detected_languages = _summarize_detected_languages(result)
         payload: dict[str, Any] = {
             "task": "transcribe",
             "language": result.language or "unknown",
@@ -2066,6 +2108,11 @@ def _build_transcription_response(result: TranscriptionResult, response_format: 
                     "start": segment["start"],
                     "end": segment["end"],
                     "text": segment["text"],
+                    **(
+                        {"language": segment["language"]}
+                        if _to_language_code(str(segment.get("language", "")).strip())
+                        else {}
+                    ),
                     "tokens": [],
                     "temperature": 0.0,
                     "avg_logprob": 0.0,
@@ -2075,6 +2122,8 @@ def _build_transcription_response(result: TranscriptionResult, response_format: 
                 for segment in result.segments
             ],
         }
+        if detected_languages:
+            payload["detected_languages"] = detected_languages
         if result.words:
             payload["words"] = [
                 {
