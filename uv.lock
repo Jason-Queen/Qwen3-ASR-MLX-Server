@@ -1140,7 +1140,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.110.0" },
-    { name = "mlx-audio", specifier = ">=0.3.1" },
+    { name = "mlx-audio", specifier = ">=0.4.1,<0.5" },
     { name = "modelscope", specifier = ">=1.18.0" },
     { name = "nagisa", specifier = ">=0.2.11" },
     { name = "python-multipart", specifier = ">=0.0.9" },
