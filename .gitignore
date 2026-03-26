@@ -15,6 +15,7 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+AGENTS.md
 
 # Runtime/logs/temp
 *.log
