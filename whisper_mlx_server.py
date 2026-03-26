@@ -40,10 +40,14 @@ else:
     IMPORT_ERROR = None
 
 BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_HF_ASR_REPO_ID = "mlx-community/Qwen3-ASR-1.7B-bf16"
+DEFAULT_HF_ALIGNER_REPO_ID = "mlx-community/Qwen3-ForcedAligner-0.6B-bf16"
+SETUP_COMMAND_HINT = "python qwen3_asr_mlx_server.py setup"
 
 
-def _workspace_root() -> Path | None:
-    parent = BASE_DIR.parent
+def _workspace_root(base_dir: Path | None = None) -> Path | None:
+    root = base_dir or BASE_DIR
+    parent = root.parent
     if (parent / "README_WORKSPACE.md").exists():
         return parent
     if (parent / "qwen3-asr-whisper-api-debug").exists() and (
@@ -53,38 +57,98 @@ def _workspace_root() -> Path | None:
     return None
 
 
-def _candidate_asset_dirs(dirname: str) -> list[Path]:
-    candidates = [BASE_DIR / dirname]
-    workspace_root = _workspace_root()
+def _huggingface_hub_cache_dir() -> Path:
+    hub_cache = os.getenv("HUGGINGFACE_HUB_CACHE")
+    if hub_cache:
+        return Path(hub_cache)
+
+    hf_home = os.getenv("HF_HOME")
+    if hf_home:
+        return Path(hf_home) / "hub"
+
+    xdg_cache_home = os.getenv("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        return Path(xdg_cache_home) / "huggingface" / "hub"
+
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _huggingface_snapshot_dirs(repo_id: str) -> list[Path]:
+    repo_cache_dir = _huggingface_hub_cache_dir() / f"models--{repo_id.replace('/', '--')}"
+    snapshots_dir = repo_cache_dir / "snapshots"
+    candidates: list[Path] = []
+
+    ref_main = repo_cache_dir / "refs" / "main"
+    if ref_main.exists():
+        try:
+            revision = ref_main.read_text(encoding="utf-8").strip()
+        except OSError:
+            revision = ""
+        if revision:
+            snapshot_dir = snapshots_dir / revision
+            if snapshot_dir.exists():
+                candidates.append(snapshot_dir)
+
+    if snapshots_dir.exists():
+        for path in sorted(
+            (item for item in snapshots_dir.iterdir() if item.is_dir()),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        ):
+            if path not in candidates:
+                candidates.append(path)
+
+    return candidates
+
+
+def _candidate_asset_dirs(
+    dirname: str,
+    *,
+    hf_repo: str | None = None,
+    base_dir: Path | None = None,
+) -> list[Path]:
+    root = base_dir or BASE_DIR
+    candidates: list[Path] = []
+    if hf_repo:
+        candidates.extend(_huggingface_snapshot_dirs(hf_repo))
+
+    candidates.append(root / dirname)
+    workspace_root = _workspace_root(root)
     if workspace_root is not None:
         candidates.append(workspace_root / "models" / dirname)
         candidates.append(workspace_root / dirname)
     return candidates
 
 
-def _default_asset_path(dirname: str) -> str:
-    for path in _candidate_asset_dirs(dirname):
+def _default_asset_path(
+    dirname: str,
+    *,
+    hf_repo: str | None = None,
+    base_dir: Path | None = None,
+) -> str:
+    for path in _candidate_asset_dirs(dirname, hf_repo=hf_repo, base_dir=base_dir):
         if path.exists():
             return str(path)
 
-    workspace_root = _workspace_root()
+    workspace_root = _workspace_root(base_dir)
     if workspace_root is not None:
         return str(workspace_root / "models" / dirname)
-    return str(BASE_DIR / dirname)
+    root = base_dir or BASE_DIR
+    return str(root / dirname)
 
 
-DEFAULT_MODEL_PATH = _default_asset_path("Qwen3-ASR-1.7B-bf16")
+HF_ASR_REPO = os.getenv("QWEN_MLX_HF_ASR_REPO", DEFAULT_HF_ASR_REPO_ID)
+MS_ASR_REPO = os.getenv("QWEN_MLX_MS_ASR_REPO", HF_ASR_REPO)
+HF_ALIGNER_REPO = os.getenv("QWEN_MLX_HF_ALIGNER_REPO", DEFAULT_HF_ALIGNER_REPO_ID)
+MS_ALIGNER_REPO = os.getenv("QWEN_MLX_MS_ALIGNER_REPO", HF_ALIGNER_REPO)
+DEFAULT_MODEL_PATH = _default_asset_path("Qwen3-ASR-1.7B-bf16", hf_repo=HF_ASR_REPO)
 MODEL_PATH = os.getenv("QWEN_MLX_MODEL_PATH", DEFAULT_MODEL_PATH)
 MODEL_ID = os.getenv("QWEN_MLX_MODEL_ID", "qwen3-asr-mlx")
-DEFAULT_ALIGNER_PATH = _default_asset_path("Qwen3-ForcedAligner-0.6B-bf16")
-ALIGNER_PATH = os.getenv("QWEN_MLX_ALIGNER_PATH", DEFAULT_ALIGNER_PATH)
-HF_ASR_REPO = os.getenv("QWEN_MLX_HF_ASR_REPO", "mlx-community/Qwen3-ASR-1.7B-bf16")
-MS_ASR_REPO = os.getenv("QWEN_MLX_MS_ASR_REPO", HF_ASR_REPO)
-HF_ALIGNER_REPO = os.getenv(
-    "QWEN_MLX_HF_ALIGNER_REPO",
-    "mlx-community/Qwen3-ForcedAligner-0.6B-bf16",
+DEFAULT_ALIGNER_PATH = _default_asset_path(
+    "Qwen3-ForcedAligner-0.6B-bf16",
+    hf_repo=HF_ALIGNER_REPO,
 )
-MS_ALIGNER_REPO = os.getenv("QWEN_MLX_MS_ALIGNER_REPO", HF_ALIGNER_REPO)
+ALIGNER_PATH = os.getenv("QWEN_MLX_ALIGNER_PATH", DEFAULT_ALIGNER_PATH)
 ALIGNMENT_CHUNK_SECONDS = float(os.getenv("QWEN_MLX_ALIGNMENT_CHUNK_SECONDS", "30"))
 AUTO_ALIGN_LANG_CODES = {
     code.strip().lower()
@@ -464,6 +528,13 @@ def _prompt_yes_no(prompt: str, default_yes: bool = True) -> bool:
     return raw in {"y", "yes"}
 
 
+def _manual_model_setup_help(env_var: str) -> str:
+    return (
+        f"Set {env_var} to an existing model directory, "
+        f"or download it manually via: {SETUP_COMMAND_HINT}"
+    )
+
+
 def _prompt_download_source() -> str:
     while True:
         choice = input(
@@ -610,21 +681,20 @@ def maybe_prompt_initial_setup() -> None:
     if Path(MODEL_PATH).exists():
         return
 
-    hint = "python qwen3_asr_mlx_server.py setup"
     logger.warning(
-        "ASR model missing at %s. Run setup first: %s",
+        "ASR model missing at %s. %s",
         MODEL_PATH,
-        hint,
+        _manual_model_setup_help("QWEN_MLX_MODEL_PATH"),
     )
     if not _is_interactive_terminal():
         return
     print(
-        "\nQwen3 ASR model is not downloaded yet.\n"
-        f"Required path: {MODEL_PATH}\n"
-        f"You can run setup now (or later via: {hint}).\n"
+        "\nQwen3 ASR model is not available.\n"
+        f"Resolved path: {MODEL_PATH}\n"
+        "The server checks the Hugging Face cache first, then repo/workspace-local model directories.\n"
+        f"{_manual_model_setup_help('QWEN_MLX_MODEL_PATH')}\n"
+        "Automatic download during normal serving is disabled.\n"
     )
-    if _prompt_yes_no("Run setup wizard now?", default_yes=True):
-        run_setup_wizard()
 
 
 def _normalize_requested_model_name(model_name: Any) -> str:
@@ -692,7 +762,7 @@ def _ensure_transcriber_ready_or_raise(requested_model: Any) -> str:
             detail=(
                 f"Model files are missing at '{MODEL_PATH}'. "
                 "Automatic download is disabled. "
-                "Run setup manually: python qwen3_asr_mlx_server.py setup"
+                f"{_manual_model_setup_help('QWEN_MLX_MODEL_PATH')}"
             ),
         )
     if not transcriber.is_ready():
@@ -2613,7 +2683,8 @@ async def _run_transcription_pipeline(
                         status_code=400,
                         detail=(
                             "Forced alignment requested but aligner model is unavailable. "
-                            f"error={aligner_error}"
+                            f"error={aligner_error}. "
+                            f"{_manual_model_setup_help('QWEN_MLX_ALIGNER_PATH')}"
                         ),
                     )
                 logger.warning("[%s] Alignment skipped: %s", request_id, aligner_error)

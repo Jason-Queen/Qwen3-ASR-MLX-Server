@@ -141,6 +141,8 @@ python qwen3_asr_mlx_server.py
 
 - API 请求里的 `model` 字段用于兼容与校验；
 - 实际加载的模型由 `QWEN_MLX_MODEL_PATH` 决定。
+- 默认服务不会在启动或请求过程中自动下载模型；若自动识别不到缓存目录或本地目录，请显式设置
+  `QWEN_MLX_MODEL_PATH` / `QWEN_MLX_ALIGNER_PATH`，或手动运行 `python qwen3_asr_mlx_server.py setup`。
 
 ### 5）快速测试
 
