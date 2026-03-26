@@ -186,6 +186,11 @@ uv run --python 3.11 qwen3-asr-mlx-server --log-prompts
   - `zh/en`：需要 aligner 模型可用
   - `ja`：需要 aligner + `nagisa`
   - `ko`：需要 aligner + `soynlp`
+- `verbose_json` 响应里：
+  - `language` 表示主语种，不表示全文件唯一语种
+  - `primary_language` 是与 `language` 等值的显式别名
+  - `segments[].language` 表示局部分段语种
+  - `detected_languages[]` 表示基于分段聚合的语种及时长摘要
 
 ## 警告
 
