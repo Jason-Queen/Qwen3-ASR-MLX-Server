@@ -2,7 +2,7 @@
 set -euo pipefail
 
 HOST="${QWEN_MLX_HOST:-127.0.0.1}"
-PORT="${1:-8990}"
+PORT="${1:-8989}"
 MODEL="${QWEN_MLX_MODEL_ID:-qwen3-asr-mlx}"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
@@ -15,7 +15,7 @@ fi
 
 BASE_URL="http://${HOST}:${PORT}"
 TIMESTAMP="$(date '+%Y%m%d-%H%M%S')"
-OUT_DIR="../../artifacts/validation/${TIMESTAMP}-debug-${PORT}"
+OUT_DIR="../../artifacts/validation/${TIMESTAMP}-release-${PORT}"
 mkdir -p "$OUT_DIR"
 
 echo "Checking healthz..."
