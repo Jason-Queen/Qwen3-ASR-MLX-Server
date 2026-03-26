@@ -32,6 +32,11 @@
 
 若模型文件缺失，API 会返回明确的 setup 提示。服务不会在请求时自动下载模型。
 
+如果你是在维护工作区 `/Users/kay/Dev/qwen-asr` 中使用本仓：
+
+- 服务也会自动识别共享模型目录 `../models/`
+- workspace 级统一入口位于 `../scripts/start_debug.sh`、`../scripts/start_release.sh`、`../scripts/validate_workspace.sh`
+
 ## 使用指南
 
 ### 1）克隆仓库
