@@ -1057,6 +1057,75 @@ def _resolve_primary_language_from_segments(segments: list[dict[str, Any]]) -> s
     )
 
 
+def _segment_overlap_seconds(left: dict[str, Any], right: dict[str, Any]) -> float:
+    left_start = _to_float(left.get("start"), 0.0)
+    left_end = _to_float(left.get("end"), left_start)
+    right_start = _to_float(right.get("start"), 0.0)
+    right_end = _to_float(right.get("end"), right_start)
+    return max(0.0, min(left_end, right_end) - max(left_start, right_start))
+
+
+def _restore_segment_languages_from_overlap(
+    source_segments: list[dict[str, Any]],
+    rebuilt_segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not source_segments or not rebuilt_segments:
+        return rebuilt_segments
+
+    language_sources: list[dict[str, Any]] = []
+    for index, segment in enumerate(source_segments):
+        code = _to_language_code(str(segment.get("language", "")).strip())
+        if not code:
+            continue
+        language_sources.append(
+            {
+                "language": code,
+                "start": _to_float(segment.get("start"), 0.0),
+                "end": _to_float(segment.get("end"), _to_float(segment.get("start"), 0.0)),
+                "index": index,
+            }
+        )
+
+    if not language_sources:
+        return rebuilt_segments
+
+    restored: list[dict[str, Any]] = []
+    for segment in rebuilt_segments:
+        item = dict(segment)
+        existing_code = _to_language_code(str(item.get("language", "")).strip())
+        if existing_code:
+            item["language"] = existing_code
+            restored.append(item)
+            continue
+
+        stats: dict[str, dict[str, float | int]] = {}
+        for source in language_sources:
+            overlap = _segment_overlap_seconds(item, source)
+            if overlap <= 0:
+                continue
+
+            code = str(source["language"])
+            bucket = stats.setdefault(
+                code,
+                {"weight": 0.0, "count": 0, "first_index": int(source["index"])},
+            )
+            bucket["weight"] = float(bucket["weight"]) + overlap
+            bucket["count"] = int(bucket["count"]) + 1
+
+        if stats:
+            item["language"] = max(
+                stats,
+                key=lambda code: (
+                    float(stats[code]["weight"]),
+                    int(stats[code]["count"]),
+                    -int(stats[code]["first_index"]),
+                ),
+            )
+        restored.append(item)
+
+    return restored
+
+
 def _summarize_detected_languages(result: TranscriptionResult) -> list[dict[str, Any]]:
     stats: dict[str, dict[str, float | int]] = {}
     for index, segment in enumerate(result.segments):
@@ -2796,12 +2865,17 @@ async def _run_transcription_pipeline(
                 else:
                     result.words = aligned_words
                     if SEGMENT_REBUILD_FROM_WORDS and aligned_words:
+                        source_segments = [dict(segment) for segment in result.segments]
                         rebuilt_segments = _rebuild_segments_from_words(
                             words=aligned_words,
                             text=result.text,
                             lang_code=detected_language_code,
                         )
                         if rebuilt_segments:
+                            rebuilt_segments = _restore_segment_languages_from_overlap(
+                                source_segments,
+                                rebuilt_segments,
+                            )
                             result.segments = rebuilt_segments
                             logger.info(
                                 "[%s] sentence_segments=on segments_rebuilt=%d",
