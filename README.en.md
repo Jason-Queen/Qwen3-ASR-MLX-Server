@@ -184,6 +184,11 @@ Chunk size tuning guidance:
   - `zh/en`: aligner model must be ready
   - `ja`: aligner + `nagisa`
   - `ko`: aligner + `soynlp`
+- In `verbose_json` responses:
+  - `language` represents the dominant language, not the only language in the file
+  - `primary_language` is an explicit alias of `language`
+  - `segments[].language` represents per-segment language
+  - `detected_languages[]` summarizes detected languages and durations from segments
 
 ## Warning
 

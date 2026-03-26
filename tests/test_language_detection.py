@@ -80,6 +80,7 @@ class LanguageDetectionTests(unittest.TestCase):
         payload = json.loads(response.body)
 
         self.assertEqual(payload["language"], "zh")
+        self.assertEqual(payload["primary_language"], "zh")
         self.assertEqual(payload["segments"][0]["language"], "zh")
         self.assertEqual(payload["segments"][1]["language"], "en")
         self.assertEqual(payload["segments"][2]["language"], "yue")
@@ -103,6 +104,8 @@ class LanguageDetectionTests(unittest.TestCase):
         response = _build_transcription_response(result, "verbose_json")
         payload = json.loads(response.body)
 
+        self.assertEqual(payload["language"], "en")
+        self.assertEqual(payload["primary_language"], "en")
         self.assertNotIn("language", payload["segments"][0])
         self.assertEqual(payload["detected_languages"], [{"code": "en", "duration": 2.0}])
 

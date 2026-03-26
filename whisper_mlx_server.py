@@ -2164,10 +2164,12 @@ def _build_transcription_response(result: TranscriptionResult, response_format: 
         return PlainTextResponse(content=result.text)
 
     if response_format == "verbose_json":
+        primary_language = result.language or "unknown"
         detected_languages = _summarize_detected_languages(result)
         payload: dict[str, Any] = {
             "task": "transcribe",
-            "language": result.language or "unknown",
+            "language": primary_language,
+            "primary_language": primary_language,
             "duration": result.duration,
             "text": result.text,
             "segments": [
