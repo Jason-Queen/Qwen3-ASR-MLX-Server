@@ -4,6 +4,13 @@ set -euo pipefail
 HOST="${QWEN_MLX_HOST:-127.0.0.1}"
 PORT="${1:-8989}"
 MODEL="${QWEN_MLX_MODEL_ID:-qwen3-asr-mlx}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+WORKSPACE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
+ARTIFACT_ROOT="${REPO_ROOT}/artifacts/validation"
+if [[ -f "${WORKSPACE_ROOT}/README_WORKSPACE.md" ]]; then
+  ARTIFACT_ROOT="${WORKSPACE_ROOT}/artifacts/validation"
+fi
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -15,7 +22,7 @@ fi
 
 BASE_URL="http://${HOST}:${PORT}"
 TIMESTAMP="$(date '+%Y%m%d-%H%M%S')"
-OUT_DIR="../../artifacts/validation/${TIMESTAMP}-release-${PORT}"
+OUT_DIR="${ARTIFACT_ROOT}/${TIMESTAMP}-release-${PORT}"
 mkdir -p "$OUT_DIR"
 
 echo "Checking healthz..."
