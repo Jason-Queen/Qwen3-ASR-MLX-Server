@@ -40,10 +40,43 @@ else:
     IMPORT_ERROR = None
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_PATH = str(BASE_DIR / "Qwen3-ASR-1.7B-bf16")
+
+
+def _workspace_root() -> Path | None:
+    parent = BASE_DIR.parent
+    if (parent / "README_WORKSPACE.md").exists():
+        return parent
+    if (parent / "qwen3-asr-whisper-api-debug").exists() and (
+        parent / "qwen3-asr-whisper-api-github"
+    ).exists():
+        return parent
+    return None
+
+
+def _candidate_asset_dirs(dirname: str) -> list[Path]:
+    candidates = [BASE_DIR / dirname]
+    workspace_root = _workspace_root()
+    if workspace_root is not None:
+        candidates.append(workspace_root / "models" / dirname)
+        candidates.append(workspace_root / dirname)
+    return candidates
+
+
+def _default_asset_path(dirname: str) -> str:
+    for path in _candidate_asset_dirs(dirname):
+        if path.exists():
+            return str(path)
+
+    workspace_root = _workspace_root()
+    if workspace_root is not None:
+        return str(workspace_root / "models" / dirname)
+    return str(BASE_DIR / dirname)
+
+
+DEFAULT_MODEL_PATH = _default_asset_path("Qwen3-ASR-1.7B-bf16")
 MODEL_PATH = os.getenv("QWEN_MLX_MODEL_PATH", DEFAULT_MODEL_PATH)
 MODEL_ID = os.getenv("QWEN_MLX_MODEL_ID", "qwen3-asr-mlx")
-DEFAULT_ALIGNER_PATH = str(BASE_DIR / "Qwen3-ForcedAligner-0.6B-bf16")
+DEFAULT_ALIGNER_PATH = _default_asset_path("Qwen3-ForcedAligner-0.6B-bf16")
 ALIGNER_PATH = os.getenv("QWEN_MLX_ALIGNER_PATH", DEFAULT_ALIGNER_PATH)
 HF_ASR_REPO = os.getenv("QWEN_MLX_HF_ASR_REPO", "mlx-community/Qwen3-ASR-1.7B-bf16")
 MS_ASR_REPO = os.getenv("QWEN_MLX_MS_ASR_REPO", HF_ASR_REPO)
@@ -463,9 +496,7 @@ def _download_from_modelscope(repo_id: str, local_path: str) -> None:
         from modelscope.hub.snapshot_download import snapshot_download as ms_snapshot_download
     except Exception as exc:
         raise RuntimeError(
-            "ModelScope downloader is unavailable. Install project dependencies first "
-            "(recommended: uv sync --python 3.11; alternatives: pip install -r requirements.txt "
-            "or conda env create -f environment.yml)."
+            "ModelScope downloader is unavailable. Install it first: pip install modelscope"
         ) from exc
 
     target = Path(local_path)
@@ -696,12 +727,12 @@ def _normalize_result(
     requested_language: str | None,
 ) -> TranscriptionResult:
     text: str | None = None
-    language: str | None = None
+    raw_language: Any = None
     segments: list[dict[str, Any]] = []
 
     if isinstance(raw_result, dict):
         text = _coalesce_text(raw_result)
-        language = _as_optional_str(raw_result.get("language"))
+        raw_language = raw_result.get("language")
         segments = _normalize_segments(raw_result.get("segments") or raw_result.get("chunks"))
 
     elif isinstance(raw_result, str):
@@ -714,7 +745,7 @@ def _normalize_result(
 
     else:
         text = _coalesce_text(raw_result)
-        language = _as_optional_str(getattr(raw_result, "language", None))
+        raw_language = getattr(raw_result, "language", None)
         segments = _normalize_segments(
             getattr(raw_result, "segments", None) or getattr(raw_result, "chunks", None)
         )
@@ -737,8 +768,11 @@ def _normalize_result(
 
     duration = max((seg.get("end", 0.0) for seg in segments), default=0.0)
 
-    if not language:
-        language = None if requested_language in {None, "", "auto"} else requested_language
+    language = (
+        _resolve_primary_language_from_segments(segments)
+        or _select_primary_language_code(_extract_language_codes(raw_language))
+        or _to_language_code(requested_language)
+    )
 
     return TranscriptionResult(
         text=text,
@@ -763,12 +797,6 @@ def _coalesce_text(value: Any) -> str | None:
         candidate = getattr(value, attr, None)
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
-    return None
-
-
-def _as_optional_str(value: Any) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
     return None
 
 
@@ -804,8 +832,90 @@ def _log_prompt_preview(request_id: str, prompt: Any) -> None:
     )
 
 
+def _extract_language_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+
+    if isinstance(value, dict):
+        values: list[str] = []
+        for key in ("language", "lang", "language_code", "detected_language"):
+            if key in value:
+                values.extend(_extract_language_values(value.get(key)))
+        return values
+
+    if isinstance(value, (list, tuple, set)):
+        values: list[str] = []
+        for item in value:
+            values.extend(_extract_language_values(item))
+        return values
+
+    for attr in ("language", "lang"):
+        candidate = getattr(value, attr, None)
+        if candidate is not None and candidate is not value:
+            values = _extract_language_values(candidate)
+            if values:
+                return values
+
+    return []
+
+
+def _extract_language_codes(value: Any) -> list[str]:
+    codes: list[str] = []
+    for candidate in _extract_language_values(value):
+        code = _to_language_code(candidate)
+        if code:
+            codes.append(code)
+    return codes
+
+
+def _select_primary_language_code(codes: list[str]) -> str | None:
+    if not codes:
+        return None
+
+    counts: dict[str, int] = {}
+    first_index: dict[str, int] = {}
+    for index, code in enumerate(codes):
+        counts[code] = counts.get(code, 0) + 1
+        first_index.setdefault(code, index)
+
+    return max(codes, key=lambda code: (counts[code], -first_index[code]))
+
+
+def _prompt_log_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _preview_text(value: Any, max_chars: int = 120) -> str:
+    text = _prompt_log_text(value)
+    if not text:
+        return "none"
+    compact = " ".join(text.split())
+    if not compact:
+        return "none"
+    if len(compact) <= max_chars:
+        return compact
+    return f"{compact[:max_chars]}..."
+
+
+def _log_prompt_preview(request_id: str, prompt: Any) -> None:
+    if not LOG_PROMPTS:
+        return
+    prompt_text = _prompt_log_text(prompt)
+    logger.info(
+        "[%s] request_prompt prompt_len=%d prompt_preview=%s",
+        request_id,
+        len(prompt_text or ""),
+        _preview_text(prompt_text),
+    )
+
+
 def _normalize_segments(raw_segments: Any) -> list[dict[str, Any]]:
-    if not isinstance(raw_segments, list):
+    if not isinstance(raw_segments, (list, tuple)):
         return []
 
     normalized: list[dict[str, Any]] = []
@@ -817,24 +927,64 @@ def _normalize_segments(raw_segments: Any) -> list[dict[str, Any]]:
                 start = _to_float(item["timestamp"][0], start)
                 end = _to_float(item["timestamp"][1], end)
             text = str(item.get("text", "")).strip()
+            language = _select_primary_language_code(
+                _extract_language_codes(item.get("language") or item.get("lang"))
+            )
         else:
             start = _to_float(getattr(item, "start", None), 0.0)
             end = _to_float(getattr(item, "end", None), start)
             text = str(getattr(item, "text", "")).strip()
+            language = _select_primary_language_code(
+                _extract_language_codes(getattr(item, "language", None) or getattr(item, "lang", None))
+            )
 
         if not text:
             continue
 
-        normalized.append(
-            {
-                "id": index,
-                "start": start,
-                "end": max(start, end),
-                "text": text,
-            }
-        )
+        segment = {
+            "id": index,
+            "start": start,
+            "end": max(start, end),
+            "text": text,
+        }
+        if language:
+            segment["language"] = language
+        normalized.append(segment)
 
     return normalized
+
+
+def _resolve_primary_language_from_segments(segments: list[dict[str, Any]]) -> str | None:
+    if not segments:
+        return None
+
+    stats: dict[str, dict[str, float | int]] = {}
+    for index, segment in enumerate(segments):
+        code = _to_language_code(str(segment.get("language", "")).strip())
+        if not code:
+            continue
+
+        start = _to_float(segment.get("start"), 0.0)
+        end = _to_float(segment.get("end"), start)
+        weight = max(end - start, 0.0) or 1.0
+        bucket = stats.setdefault(
+            code,
+            {"weight": 0.0, "count": 0, "first_index": index},
+        )
+        bucket["weight"] = float(bucket["weight"]) + weight
+        bucket["count"] = int(bucket["count"]) + 1
+
+    if not stats:
+        return None
+
+    return max(
+        stats,
+        key=lambda code: (
+            float(stats[code]["weight"]),
+            int(stats[code]["count"]),
+            -int(stats[code]["first_index"]),
+        ),
+    )
 
 
 def _normalize_word_segments(raw: Any) -> list[dict[str, Any]]:
@@ -980,6 +1130,20 @@ def _resolve_detected_language_code(
         or _to_language_code(result_language)
         or _detect_language_code_from_text(text)
     )
+
+
+def _finalize_result_language(
+    requested_language: str | None,
+    result: TranscriptionResult,
+) -> str | None:
+    detected_language_code = _resolve_detected_language_code(
+        requested_language=requested_language,
+        result_language=result.language,
+        text=result.text,
+    )
+    if detected_language_code:
+        result.language = detected_language_code
+    return detected_language_code
 
 
 def _compute_alignment_enabled(
@@ -2423,11 +2587,7 @@ async def _run_transcription_pipeline(
 
         wav_duration_sec = _get_wav_duration_seconds(infer_audio_path)
         audio_duration_sec = wav_duration_sec or result.duration
-        detected_language_code = _resolve_detected_language_code(
-            requested_language=language,
-            result_language=result.language,
-            text=result.text,
-        )
+        detected_language_code = _finalize_result_language(language, result)
         auto_align_lang_codes = _effective_auto_align_lang_codes(aligner)
         should_align = _compute_alignment_enabled(
             alignment_mode=alignment_mode,
@@ -2477,6 +2637,7 @@ async def _run_transcription_pipeline(
                         prompt,
                         rechunk_options,
                     )
+                    detected_language_code = _finalize_result_language(language, result)
 
                 aligner_language = _to_aligner_language_name(
                     language or result.language or detected_language_code
