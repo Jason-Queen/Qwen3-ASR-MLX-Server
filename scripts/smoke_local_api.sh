@@ -16,6 +16,10 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 AUDIO_FILE="${2:-$TMPDIR/smoke.wav}"
 if [[ ! -f "$AUDIO_FILE" ]]; then
+  if ! command -v say >/dev/null 2>&1 || ! command -v afconvert >/dev/null 2>&1; then
+    echo "No input audio file provided. Auto-generating smoke audio requires macOS 'say' and 'afconvert'; pass an existing WAV file as the second argument." >&2
+    exit 1
+  fi
   say -o "$TMPDIR/smoke.aiff" "hello from qwen three asr smoke test"
   afconvert -f WAVE -d LEI16@16000 "$TMPDIR/smoke.aiff" "$AUDIO_FILE" >/dev/null 2>&1
 fi
