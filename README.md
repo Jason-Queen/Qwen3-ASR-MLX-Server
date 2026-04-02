@@ -182,6 +182,7 @@ uv run --python 3.11 qwen3-asr-mlx-server --log-prompts
 ## 说明
 
 - 仅支持 `task=transcribe`；`translate` 会被拒绝。
+- 为避免 MLX 原生层在并发下崩溃，单进程内的转录与 forced alignment 推理会串行执行；并发请求会排队而不是并行跑推理。
 - `zh/en/ja/ko` 的自动 forced alignment 会按运行时依赖自动判定：
   - `zh/en`：需要 aligner 模型可用
   - `ja`：需要 aligner + `nagisa`

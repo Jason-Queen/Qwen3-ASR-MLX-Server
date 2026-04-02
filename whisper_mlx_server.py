@@ -343,12 +343,16 @@ class TranscriptionResult:
     words: list[dict[str, Any]] = field(default_factory=list)
 
 
+_GLOBAL_INFERENCE_LOCK = Lock()
+
+
 class MLXTranscriber:
-    def __init__(self, model_path: str) -> None:
+    def __init__(self, model_path: str, infer_lock: Lock | None = None) -> None:
         self.model_path = model_path
         self._model: Any | None = None
         self._load_lock = Lock()
-        self._infer_lock = Lock()
+        # MLX inference must stay process-serial across ASR and alignment.
+        self._infer_lock = infer_lock or _GLOBAL_INFERENCE_LOCK
         self._load_error: str | None = None
 
     def load(self, strict: bool = True) -> None:
@@ -452,11 +456,12 @@ class MLXTranscriber:
 
 
 class MLXAligner:
-    def __init__(self, model_path: str) -> None:
+    def __init__(self, model_path: str, infer_lock: Lock | None = None) -> None:
         self.model_path = model_path
         self._model: Any | None = None
         self._load_lock = Lock()
-        self._infer_lock = Lock()
+        # Share the same inference lock as the transcriber to avoid native MLX crashes.
+        self._infer_lock = infer_lock or _GLOBAL_INFERENCE_LOCK
         self._load_error: str | None = None
         self._supported_languages_cache: set[str] | None = None
 

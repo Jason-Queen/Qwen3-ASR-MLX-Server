@@ -180,6 +180,7 @@ Chunk size tuning guidance:
 ## Notes
 
 - `task=transcribe` is supported; `translate` is rejected.
+- To avoid native MLX crashes under load, transcription and forced alignment inference stay serialized inside a single process; concurrent requests queue instead of running inference in parallel.
 - Auto forced-alignment for `zh/en/ja/ko` is runtime-gated by aligner/dependencies:
   - `zh/en`: aligner model must be ready
   - `ja`: aligner + `nagisa`
