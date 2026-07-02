@@ -2,9 +2,11 @@
 
 [English](./README.en.md) | 中文
 
-一个面向 macOS 的本地 FastAPI 服务，基于 Qwen3-ASR（MLX），提供 Whisper 兼容接口。
+一个面向 macOS 的本地 FastAPI 服务，基于 `mlx-audio` 与 Qwen3-ASR（MLX），提供 Whisper / OpenAI 兼容的本地转录接口。
 
-已可直接用于 Spokenly、MacWhisper 以及其它 OpenAI 兼容转录客户端。在本地实测中，普通话听写速度非常快，质量接近阿里云官方转录服务。
+兼容以 MacWhisper 为代表的转录应用，补齐 `verbose_json`、`segments`、`words`、词级时间戳和语言字段等常用响应结构，并处理 MP3 / MP4 / M4A 等输入转码。
+
+服务可直接用于 Spokenly、OpenWhispr 以及其它 OpenAI 兼容转录客户端。在本地实测中，普通话听写速度非常快，质量接近阿里云官方转录服务。
 
 ## 功能特性
 
@@ -19,7 +21,7 @@
   - `GET /v1/models`
 - 支持 multipart 音频和 JSON `audio_file`（base64/buffer/list 变体）
 - 可选 forced alignment（词级时间戳，基于 Qwen3-ForcedAligner）
-- 显式 setup 流程（请求过程中不自动下载模型）
+- 支持终端交互式 setup 流程
 
 ## 模型策略
 

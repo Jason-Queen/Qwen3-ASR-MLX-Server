@@ -2,9 +2,11 @@
 
 English | [中文](./README.md)
 
-A macOS-focused local FastAPI service for Qwen3-ASR (MLX), with Whisper-compatible endpoints.
+A macOS-focused local FastAPI service based on `mlx-audio` and Qwen3-ASR (MLX), providing local Whisper / OpenAI-compatible transcription endpoints.
 
-Ready for use with Spokenly, MacWhisper, and other OpenAI-compatible transcription clients. In local tests, Mandarin dictation is ultra-fast, and quality is close to Alibaba Cloud official transcription service.
+Compatible with transcription apps such as MacWhisper, filling in common response structures such as `verbose_json`, `segments`, `words`, word timestamps, and language fields, while handling MP3 / MP4 / M4A input transcoding.
+
+Ready for use with Spokenly, OpenWhispr, and other OpenAI-compatible transcription clients. In local tests, Mandarin dictation is very fast, with quality close to Alibaba Cloud's official transcription service.
 
 ## Features
 
@@ -19,7 +21,7 @@ Ready for use with Spokenly, MacWhisper, and other OpenAI-compatible transcripti
   - `GET /v1/models`
 - Accepts multipart audio and JSON `audio_file` payloads (base64/buffer/list variants)
 - Optional forced alignment (word timestamps) with Qwen3-ForcedAligner
-- Explicit setup flow (no request-time auto download)
+- Terminal-based interactive setup flow
 
 ## Model Policy
 
