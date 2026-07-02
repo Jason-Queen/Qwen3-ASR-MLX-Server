@@ -3001,7 +3001,7 @@ async def _run_transcription_pipeline(
 
 transcriber = MLXTranscriber(model_path=MODEL_PATH)
 aligner = MLXAligner(model_path=ALIGNER_PATH)
-app = FastAPI(title="Qwen3-ASR-MLX-Server", version="1.0.1")
+app = FastAPI(title="Qwen3-ASR-MLX-Server", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
