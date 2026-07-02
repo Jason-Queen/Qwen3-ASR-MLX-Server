@@ -3066,6 +3066,7 @@ async def transcriptions(
     task: str | None = Form(default=None),
     alignment: str | None = Form(default=None),
     enable_alignment: str | None = Form(default=None),
+    word_timestamps: str | bool | None = Form(default=None),
     max_tokens: int | None = Form(default=None),
     temperature: float | None = Form(default=None),
     top_p: float | None = Form(default=None),
@@ -3104,6 +3105,10 @@ async def transcriptions(
     alignment_mode = _parse_alignment_mode(
         alignment if alignment is not None else enable_alignment
     )
+    if alignment is None and enable_alignment is None:
+        word_ts_flag = _parse_optional_boolean(word_timestamps)
+        if word_ts_flag is not None:
+            alignment_mode = "on" if word_ts_flag else "off"
 
     if response_format not in SUPPORTED_RESPONSE_FORMATS:
         raise HTTPException(
