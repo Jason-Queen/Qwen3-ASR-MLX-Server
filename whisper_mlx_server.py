@@ -209,6 +209,9 @@ DEFAULT_ALIGNER_PATH = _default_asset_path(
 )
 ALIGNER_PATH = os.getenv("QWEN_MLX_ALIGNER_PATH", DEFAULT_ALIGNER_PATH)
 ALIGNMENT_CHUNK_SECONDS = float(os.getenv("QWEN_MLX_ALIGNMENT_CHUNK_SECONDS", "30"))
+ALIGNMENT_BOUNDARY_TOLERANCE_SECONDS = float(
+    os.getenv("QWEN_MLX_ALIGNMENT_BOUNDARY_TOLERANCE_SECONDS", "5")
+)
 AUTO_ALIGN_LANG_CODES = {
     code.strip().lower()
     for code in os.getenv("QWEN_MLX_AUTO_ALIGN_LANG_CODES", "zh,en,ja,ko").split(",")
@@ -1531,9 +1534,71 @@ def _segment_text_for_chunks(
     return merged
 
 
+def _segment_end_boundaries_for_alignment(
+    segments: list[dict[str, Any]],
+    duration_sec: float,
+) -> list[float]:
+    boundaries: list[float] = []
+    for segment in segments:
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        end = _to_float(segment.get("end"), 0.0)
+        if 0.0 < end < duration_sec:
+            boundaries.append(end)
+
+    deduped: list[float] = []
+    for boundary in sorted(boundaries):
+        if not deduped or abs(boundary - deduped[-1]) > 0.001:
+            deduped.append(boundary)
+    return deduped
+
+
+def _alignment_chunk_boundaries_from_segments(
+    segments: list[dict[str, Any]],
+    duration_sec: float | None,
+    max_chunk_seconds: float,
+    boundary_tolerance_seconds: float,
+) -> list[float]:
+    if not duration_sec or duration_sec <= 0.0:
+        return [0.0]
+    if max_chunk_seconds <= 0.0 or duration_sec <= max_chunk_seconds:
+        return [0.0, duration_sec]
+
+    tolerance = max(0.0, boundary_tolerance_seconds)
+    segment_boundaries = _segment_end_boundaries_for_alignment(segments, duration_sec)
+    boundaries = [0.0]
+
+    while duration_sec - boundaries[-1] > max_chunk_seconds:
+        previous = boundaries[-1]
+        target = previous + max_chunk_seconds
+        selected = target
+
+        if tolerance > 0.0 and segment_boundaries:
+            lower = max(previous + 0.001, target - tolerance)
+            upper = min(duration_sec - 0.001, target + tolerance)
+            candidates = [
+                boundary
+                for boundary in segment_boundaries
+                if lower <= boundary <= upper
+            ]
+            if candidates:
+                selected = min(candidates, key=lambda boundary: (abs(boundary - target), boundary))
+
+        selected = max(previous + 0.001, min(selected, duration_sec))
+        if selected >= duration_sec:
+            break
+        boundaries.append(selected)
+
+    if boundaries[-1] < duration_sec:
+        boundaries.append(duration_sec)
+    return boundaries
+
+
 def _split_wav_into_temp_chunks(
     wav_path: str,
     max_chunk_seconds: float,
+    split_boundaries: list[float] | None = None,
 ) -> list[tuple[str, float, float]]:
     if max_chunk_seconds <= 0:
         return [(wav_path, 0.0, _get_wav_duration_seconds(wav_path) or 0.0)]
@@ -1548,15 +1613,35 @@ def _split_wav_into_temp_chunks(
         sample_width = wav_file.getsampwidth()
         comptype = wav_file.getcomptype()
         compname = wav_file.getcompname()
-        chunk_frames = max(1, int(frame_rate * max_chunk_seconds))
         total_frames = wav_file.getnframes()
+        if total_frames <= 0:
+            return chunks
+        if split_boundaries:
+            frame_offsets = [0]
+            for boundary in split_boundaries[1:-1]:
+                frame_offset = int(round(max(0.0, boundary) * frame_rate))
+                frame_offset = max(1, min(frame_offset, total_frames - 1))
+                if frame_offset > frame_offsets[-1]:
+                    frame_offsets.append(frame_offset)
+            if not frame_offsets or frame_offsets[-1] != total_frames:
+                frame_offsets.append(total_frames)
+        else:
+            chunk_frames = max(1, int(frame_rate * max_chunk_seconds))
+            frame_offsets = list(range(0, total_frames, chunk_frames))
+            if not frame_offsets or frame_offsets[0] != 0:
+                frame_offsets.insert(0, 0)
+            if frame_offsets[-1] != total_frames:
+                frame_offsets.append(total_frames)
+
         frame_offset = 0
 
-        while frame_offset < total_frames:
-            read_frames = min(chunk_frames, total_frames - frame_offset)
+        for next_frame_offset in frame_offsets[1:]:
+            read_frames = max(0, next_frame_offset - frame_offset)
+            if read_frames <= 0:
+                continue
             frames = wav_file.readframes(read_frames)
             start_sec = frame_offset / float(frame_rate)
-            end_sec = (frame_offset + read_frames) / float(frame_rate)
+            end_sec = next_frame_offset / float(frame_rate)
 
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
                 chunk_path = tmp_file.name
@@ -1567,7 +1652,7 @@ def _split_wav_into_temp_chunks(
                 out_file.setcomptype(comptype, compname)
                 out_file.writeframes(frames)
             chunks.append((chunk_path, start_sec, end_sec))
-            frame_offset += read_frames
+            frame_offset = next_frame_offset
 
     return chunks
 
@@ -1586,7 +1671,17 @@ def _apply_alignment(
     if not duration_sec or duration_sec <= max_chunk_seconds:
         return aligner.align(audio=audio_path, text=result.text, language=aligner_language)
 
-    chunk_specs = _split_wav_into_temp_chunks(audio_path, max_chunk_seconds)
+    split_boundaries = _alignment_chunk_boundaries_from_segments(
+        result.segments,
+        duration_sec,
+        max_chunk_seconds,
+        ALIGNMENT_BOUNDARY_TOLERANCE_SECONDS,
+    )
+    chunk_specs = _split_wav_into_temp_chunks(
+        audio_path,
+        max_chunk_seconds,
+        split_boundaries=split_boundaries,
+    )
     chunk_paths = [chunk_path for chunk_path, _, _ in chunk_specs]
     try:
         chunk_texts = _segment_text_for_chunks(result, chunk_specs)

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
+import wave
 from unittest import mock
 
 from fastapi.testclient import TestClient
@@ -140,6 +143,76 @@ class AlignmentDecisionTests(unittest.TestCase):
         )
 
         self.assertFalse(enabled)
+
+
+class AlignmentChunkBoundaryTests(unittest.TestCase):
+    def test_chunk_boundaries_snap_to_near_segment_end(self) -> None:
+        boundaries = server._alignment_chunk_boundaries_from_segments(
+            segments=[
+                {"id": 0, "start": 0.0, "end": 28.6, "text": "first sentence"},
+                {"id": 1, "start": 28.6, "end": 61.2, "text": "second sentence"},
+            ],
+            duration_sec=70.0,
+            max_chunk_seconds=30.0,
+            boundary_tolerance_seconds=5.0,
+        )
+
+        self.assertEqual(boundaries, [0.0, 28.6, 61.2, 70.0])
+
+    def test_chunk_boundaries_fall_back_to_fixed_target_without_near_segment_end(self) -> None:
+        boundaries = server._alignment_chunk_boundaries_from_segments(
+            segments=[
+                {"id": 0, "start": 0.0, "end": 12.0, "text": "too early"},
+                {"id": 1, "start": 12.0, "end": 48.0, "text": "too late"},
+            ],
+            duration_sec=70.0,
+            max_chunk_seconds=30.0,
+            boundary_tolerance_seconds=5.0,
+        )
+
+        self.assertEqual(boundaries, [0.0, 30.0, 60.0, 70.0])
+
+    def test_chunk_boundaries_keep_fixed_target_when_tolerance_is_zero(self) -> None:
+        boundaries = server._alignment_chunk_boundaries_from_segments(
+            segments=[{"id": 0, "start": 0.0, "end": 28.6, "text": "near target"}],
+            duration_sec=65.0,
+            max_chunk_seconds=30.0,
+            boundary_tolerance_seconds=0.0,
+        )
+
+        self.assertEqual(boundaries, [0.0, 30.0, 60.0, 65.0])
+
+    def test_split_wav_uses_segment_snapped_boundaries(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+            wav_path = tmp_file.name
+
+        chunk_paths: list[str] = []
+        try:
+            with wave.open(wav_path, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(10)
+                wav_file.writeframes(b"\x00\x00" * 70)
+
+            chunks = server._split_wav_into_temp_chunks(
+                wav_path,
+                max_chunk_seconds=3.0,
+                split_boundaries=[0.0, 2.5, 5.0, 7.0],
+            )
+            chunk_paths = [path for path, _start, _end in chunks]
+            ranges = [(round(start, 1), round(end, 1)) for _path, start, end in chunks]
+
+            self.assertEqual(ranges, [(0.0, 2.5), (2.5, 5.0), (5.0, 7.0)])
+        finally:
+            for path in chunk_paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

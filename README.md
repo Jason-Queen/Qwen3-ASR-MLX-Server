@@ -165,6 +165,7 @@ QWEN_MLX_HOST=127.0.0.1
 QWEN_MLX_PORT=8989
 QWEN_MLX_MAX_UPLOAD_MB=100
 QWEN_MLX_ALIGNMENT_CHUNK_SECONDS=30
+QWEN_MLX_ALIGNMENT_BOUNDARY_TOLERANCE_SECONDS=5
 QWEN_MLX_AUTO_ALIGN_LANG_CODES=zh,en,ja,ko
 QWEN_MLX_LOG_PROMPTS=0
 ```
@@ -177,9 +178,10 @@ uv run --python 3.11 qwen3-asr-mlx-server --log-prompts
 
 分片时长调优建议：
 
-- `30`（默认，推荐）：时间戳精度和识别稳定性更平衡。
+- `30`（默认，推荐）：作为目标窗口，时间戳精度和识别稳定性更平衡；实际切点默认会在 5 秒范围内优先吸附到 ASR segment 结尾，避免切断句子。
 - `15`（更激进）：时间戳可能更细，但速度更慢，且上下文更碎。
 - `60+`：速度更快，但时间戳通常更粗。
+- `QWEN_MLX_ALIGNMENT_BOUNDARY_TOLERANCE_SECONDS=0` 可以恢复固定秒数硬切。
 
 ## 说明
 

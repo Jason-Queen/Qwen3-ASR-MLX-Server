@@ -163,6 +163,7 @@ QWEN_MLX_HOST=127.0.0.1
 QWEN_MLX_PORT=8989
 QWEN_MLX_MAX_UPLOAD_MB=100
 QWEN_MLX_ALIGNMENT_CHUNK_SECONDS=30
+QWEN_MLX_ALIGNMENT_BOUNDARY_TOLERANCE_SECONDS=5
 QWEN_MLX_AUTO_ALIGN_LANG_CODES=zh,en,ja,ko
 QWEN_MLX_LOG_PROMPTS=0
 ```
@@ -175,9 +176,10 @@ uv run --python 3.11 qwen3-asr-mlx-server --log-prompts
 
 Chunk size tuning guidance:
 
-- `30` (default, recommended): balanced timestamp quality and recognition stability.
+- `30` (default, recommended): used as the target window for balanced timestamp quality and recognition stability; actual split points snap to nearby ASR segment ends within 5 seconds by default to avoid cutting through sentences.
 - `15` (aggressive): potentially finer timestamps, but slower and more context-fragmented recognition.
 - `60+`: faster, but usually coarser timestamps.
+- `QWEN_MLX_ALIGNMENT_BOUNDARY_TOLERANCE_SECONDS=0` restores fixed-duration hard cuts.
 
 ## Notes
 
