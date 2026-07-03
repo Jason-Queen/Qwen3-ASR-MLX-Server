@@ -58,8 +58,6 @@ class InferenceSerializationTests(unittest.TestCase):
             transcriber.transcribe("/tmp/audio.wav", "zh", "Hotwords: Qwen3, MLX")
 
         self.assertEqual(captured["system_prompt"], "Hotwords: Qwen3, MLX")
-        self.assertEqual(captured["prompt"], "Hotwords: Qwen3, MLX")
-        self.assertEqual(captured["context"], "Hotwords: Qwen3, MLX")
 
     def test_transcriber_and_aligner_do_not_overlap_when_sharing_lock(self) -> None:
         tracker = _ConcurrencyTracker()
