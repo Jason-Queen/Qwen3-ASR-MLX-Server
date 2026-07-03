@@ -430,6 +430,7 @@ class MLXTranscriber:
                     "language": None if language in {None, "", "auto"} else language,
                     "prompt": prompt,
                     "context": prompt,
+                    "system_prompt": prompt,
                 }
                 if decode_options:
                     candidates.update(decode_options)

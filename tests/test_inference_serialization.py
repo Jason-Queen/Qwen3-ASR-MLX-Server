@@ -41,6 +41,26 @@ class InferenceSerializationTests(unittest.TestCase):
     def test_global_instances_share_same_inference_lock(self) -> None:
         self.assertIs(server.transcriber._infer_lock, server.aligner._infer_lock)
 
+    def test_openai_prompt_is_forwarded_as_qwen3_system_prompt(self) -> None:
+        captured: dict[str, object] = {}
+        transcriber = server.MLXTranscriber("/tmp/asr")
+        transcriber._model = object()
+
+        def fake_generate_transcription(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return {"text": "hello"}
+
+        with mock.patch.object(
+            server,
+            "generate_transcription",
+            side_effect=fake_generate_transcription,
+        ):
+            transcriber.transcribe("/tmp/audio.wav", "zh", "Hotwords: Qwen3, MLX")
+
+        self.assertEqual(captured["system_prompt"], "Hotwords: Qwen3, MLX")
+        self.assertEqual(captured["prompt"], "Hotwords: Qwen3, MLX")
+        self.assertEqual(captured["context"], "Hotwords: Qwen3, MLX")
+
     def test_transcriber_and_aligner_do_not_overlap_when_sharing_lock(self) -> None:
         tracker = _ConcurrencyTracker()
         shared_lock = threading.Lock()
