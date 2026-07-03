@@ -67,6 +67,69 @@ class MultipartTranscriptionEndpointTests(unittest.TestCase):
         self.assertEqual(status_code, 200)
         self.assertEqual(captured["alignment_mode"], "off")
 
+    def test_multipart_response_format_is_forwarded_to_pipeline(self) -> None:
+        status_code, captured = self._post_with_form({"response_format": "verbose_json"})
+
+        self.assertEqual(status_code, 200)
+        self.assertEqual(captured["response_format"], "verbose_json")
+
+
+class AlignmentDecisionTests(unittest.TestCase):
+    def test_auto_alignment_is_disabled_for_plain_json(self) -> None:
+        enabled = server._compute_alignment_enabled(
+            alignment_mode="auto",
+            word_timestamps_requested=False,
+            response_format="json",
+            detected_language_code="zh",
+            auto_align_lang_codes={"zh", "en"},
+        )
+
+        self.assertFalse(enabled)
+
+    def test_auto_alignment_is_disabled_for_plain_text(self) -> None:
+        enabled = server._compute_alignment_enabled(
+            alignment_mode="auto",
+            word_timestamps_requested=False,
+            response_format="text",
+            detected_language_code="en",
+            auto_align_lang_codes={"zh", "en"},
+        )
+
+        self.assertFalse(enabled)
+
+    def test_auto_alignment_is_enabled_for_verbose_json_supported_language(self) -> None:
+        enabled = server._compute_alignment_enabled(
+            alignment_mode="auto",
+            word_timestamps_requested=False,
+            response_format="verbose_json",
+            detected_language_code="zh",
+            auto_align_lang_codes={"zh", "en"},
+        )
+
+        self.assertTrue(enabled)
+
+    def test_explicit_word_timestamps_override_plain_json(self) -> None:
+        enabled = server._compute_alignment_enabled(
+            alignment_mode="auto",
+            word_timestamps_requested=True,
+            response_format="json",
+            detected_language_code="zh",
+            auto_align_lang_codes={"zh", "en"},
+        )
+
+        self.assertTrue(enabled)
+
+    def test_explicit_alignment_off_overrides_word_timestamps(self) -> None:
+        enabled = server._compute_alignment_enabled(
+            alignment_mode="off",
+            word_timestamps_requested=True,
+            response_format="verbose_json",
+            detected_language_code="zh",
+            auto_align_lang_codes={"zh", "en"},
+        )
+
+        self.assertFalse(enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

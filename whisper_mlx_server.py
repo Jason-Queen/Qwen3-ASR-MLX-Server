@@ -243,6 +243,7 @@ logging.basicConfig(
 logger = logging.getLogger("qwen3_asr_api")
 
 SUPPORTED_RESPONSE_FORMATS = {"json", "text", "verbose_json", "srt", "vtt"}
+AUTO_ALIGNMENT_RESPONSE_FORMATS = {"verbose_json", "srt", "vtt"}
 MIME_TO_SUFFIX = {
     "audio/wav": ".wav",
     "audio/x-wav": ".wav",
@@ -1375,6 +1376,7 @@ def _finalize_result_language(
 def _compute_alignment_enabled(
     alignment_mode: str,
     word_timestamps_requested: bool,
+    response_format: str,
     detected_language_code: str | None,
     auto_align_lang_codes: set[str],
 ) -> bool:
@@ -1382,6 +1384,8 @@ def _compute_alignment_enabled(
         return False
     if alignment_mode == "on" or word_timestamps_requested:
         return True
+    if response_format not in AUTO_ALIGNMENT_RESPONSE_FORMATS:
+        return False
     return (detected_language_code or "") in auto_align_lang_codes
 
 
@@ -2761,6 +2765,7 @@ async def _run_transcription_pipeline(
     language: str | None,
     prompt: str | None,
     alignment_mode: str,
+    response_format: str,
     timestamp_granularities: list[str] | None,
     decode_options: dict[str, Any] | None = None,
 ) -> TranscriptionResult:
@@ -2828,13 +2833,16 @@ async def _run_transcription_pipeline(
         should_align = _compute_alignment_enabled(
             alignment_mode=alignment_mode,
             word_timestamps_requested=word_timestamps_requested,
+            response_format=response_format,
             detected_language_code=detected_language_code,
             auto_align_lang_codes=auto_align_lang_codes,
         )
         logger.info(
-            "[%s] alignment_mode=%s word_ts_requested=%s detected_lang=%s auto_align_langs=%s should_align=%s",
+            "[%s] alignment_mode=%s response_format=%s word_ts_requested=%s detected_lang=%s "
+            "auto_align_langs=%s should_align=%s",
             request_id,
             alignment_mode,
+            response_format,
             word_timestamps_requested,
             detected_language_code or "unknown",
             ",".join(sorted(auto_align_lang_codes)) or "none",
@@ -3218,6 +3226,7 @@ async def transcriptions(
         language=language,
         prompt=prompt,
         alignment_mode=alignment_mode,
+        response_format=response_format,
         timestamp_granularities=timestamp_granularities,
         decode_options=decode_options,
     )
@@ -3292,6 +3301,7 @@ async def chat_completions(request: Request) -> Response:
         language=language,
         prompt=prompt,
         alignment_mode=alignment_mode,
+        response_format="json",
         timestamp_granularities=timestamp_granularities,
         decode_options=decode_options,
     )

@@ -183,6 +183,7 @@ Chunk size tuning guidance:
 
 - `task=transcribe` is supported; `translate` is rejected.
 - To avoid native MLX crashes under load, transcription and forced alignment inference stay serialized inside a single process; concurrent requests queue instead of running inference in parallel.
+- Auto forced-alignment runs only for timestamp-capable outputs (`verbose_json`, `srt`, `vtt`) or explicit timestamp requests. Plain `json`/`text` requests do not auto-align.
 - Auto forced-alignment for `zh/en/ja/ko` is runtime-gated by aligner/dependencies:
   - `zh/en`: aligner model must be ready
   - `ja`: aligner + `nagisa`
