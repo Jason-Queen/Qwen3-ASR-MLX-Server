@@ -1258,11 +1258,11 @@ def _normalize_timestamp_granularities(value: Any) -> list[str]:
     return [item.lower() for item in items if item]
 
 
-def _timestamp_requests_word(granularities: list[str] | None) -> bool:
+def _timestamp_requests_alignment(granularities: list[str] | None) -> bool:
     if not granularities:
         return False
     normalized = {item.lower() for item in granularities}
-    return "word" in normalized or "words" in normalized
+    return bool(normalized & {"word", "words", "segment", "segments"})
 
 
 def _parse_alignment_mode(value: Any) -> str:
@@ -1375,14 +1375,14 @@ def _finalize_result_language(
 
 def _compute_alignment_enabled(
     alignment_mode: str,
-    word_timestamps_requested: bool,
+    timestamps_requested: bool,
     response_format: str,
     detected_language_code: str | None,
     auto_align_lang_codes: set[str],
 ) -> bool:
     if alignment_mode == "off":
         return False
-    if alignment_mode == "on" or word_timestamps_requested:
+    if alignment_mode == "on" or timestamps_requested:
         return True
     if response_format not in AUTO_ALIGNMENT_RESPONSE_FORMATS:
         return False
@@ -2788,7 +2788,7 @@ async def _run_transcription_pipeline(
         detected_container or "unknown",
         language or "auto",
     )
-    word_timestamps_requested = _timestamp_requests_word(timestamp_granularities)
+    timestamps_requested = _timestamp_requests_alignment(timestamp_granularities)
 
     suffix = Path(file_name).suffix or ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as audio_file:
@@ -2832,18 +2832,18 @@ async def _run_transcription_pipeline(
         auto_align_lang_codes = _effective_auto_align_lang_codes(aligner)
         should_align = _compute_alignment_enabled(
             alignment_mode=alignment_mode,
-            word_timestamps_requested=word_timestamps_requested,
+            timestamps_requested=timestamps_requested,
             response_format=response_format,
             detected_language_code=detected_language_code,
             auto_align_lang_codes=auto_align_lang_codes,
         )
         logger.info(
-            "[%s] alignment_mode=%s response_format=%s word_ts_requested=%s detected_lang=%s "
+            "[%s] alignment_mode=%s response_format=%s timestamps_requested=%s detected_lang=%s "
             "auto_align_langs=%s should_align=%s",
             request_id,
             alignment_mode,
             response_format,
-            word_timestamps_requested,
+            timestamps_requested,
             detected_language_code or "unknown",
             ",".join(sorted(auto_align_lang_codes)) or "none",
             should_align,
@@ -2852,7 +2852,7 @@ async def _run_transcription_pipeline(
         if should_align:
             if not aligner.is_ready():
                 aligner_error = aligner.last_error() or "aligner not initialized"
-                if alignment_mode == "on" or word_timestamps_requested:
+                if alignment_mode == "on" or timestamps_requested:
                     raise HTTPException(
                         status_code=400,
                         detail=(
@@ -2890,7 +2890,7 @@ async def _run_transcription_pipeline(
                 aligner_language_code = _to_language_code(aligner_language)
                 missing_dep = _alignment_dependency_missing(aligner_language_code)
                 if missing_dep is not None:
-                    if alignment_mode == "on" or word_timestamps_requested:
+                    if alignment_mode == "on" or timestamps_requested:
                         raise HTTPException(
                             status_code=400,
                             detail=f"Forced alignment requested but {missing_dep}.",
@@ -2908,7 +2908,7 @@ async def _run_transcription_pipeline(
                         ALIGNMENT_CHUNK_SECONDS,
                     )
                 except Exception as align_exc:
-                    if alignment_mode == "on" or word_timestamps_requested:
+                    if alignment_mode == "on" or timestamps_requested:
                         raise HTTPException(
                             status_code=500,
                             detail=f"Forced alignment failed: {align_exc}",

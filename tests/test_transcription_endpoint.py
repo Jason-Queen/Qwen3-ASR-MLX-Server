@@ -78,7 +78,7 @@ class AlignmentDecisionTests(unittest.TestCase):
     def test_auto_alignment_is_disabled_for_plain_json(self) -> None:
         enabled = server._compute_alignment_enabled(
             alignment_mode="auto",
-            word_timestamps_requested=False,
+            timestamps_requested=False,
             response_format="json",
             detected_language_code="zh",
             auto_align_lang_codes={"zh", "en"},
@@ -89,7 +89,7 @@ class AlignmentDecisionTests(unittest.TestCase):
     def test_auto_alignment_is_disabled_for_plain_text(self) -> None:
         enabled = server._compute_alignment_enabled(
             alignment_mode="auto",
-            word_timestamps_requested=False,
+            timestamps_requested=False,
             response_format="text",
             detected_language_code="en",
             auto_align_lang_codes={"zh", "en"},
@@ -100,7 +100,7 @@ class AlignmentDecisionTests(unittest.TestCase):
     def test_auto_alignment_is_enabled_for_verbose_json_supported_language(self) -> None:
         enabled = server._compute_alignment_enabled(
             alignment_mode="auto",
-            word_timestamps_requested=False,
+            timestamps_requested=False,
             response_format="verbose_json",
             detected_language_code="zh",
             auto_align_lang_codes={"zh", "en"},
@@ -111,7 +111,18 @@ class AlignmentDecisionTests(unittest.TestCase):
     def test_explicit_word_timestamps_override_plain_json(self) -> None:
         enabled = server._compute_alignment_enabled(
             alignment_mode="auto",
-            word_timestamps_requested=True,
+            timestamps_requested=True,
+            response_format="json",
+            detected_language_code="zh",
+            auto_align_lang_codes={"zh", "en"},
+        )
+
+        self.assertTrue(enabled)
+
+    def test_segment_timestamp_granularity_override_plain_json(self) -> None:
+        enabled = server._compute_alignment_enabled(
+            alignment_mode="auto",
+            timestamps_requested=server._timestamp_requests_alignment(["segment"]),
             response_format="json",
             detected_language_code="zh",
             auto_align_lang_codes={"zh", "en"},
@@ -122,7 +133,7 @@ class AlignmentDecisionTests(unittest.TestCase):
     def test_explicit_alignment_off_overrides_word_timestamps(self) -> None:
         enabled = server._compute_alignment_enabled(
             alignment_mode="off",
-            word_timestamps_requested=True,
+            timestamps_requested=True,
             response_format="verbose_json",
             detected_language_code="zh",
             auto_align_lang_codes={"zh", "en"},
