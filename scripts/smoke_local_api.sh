@@ -43,6 +43,20 @@ mkdir -p "$OUT_DIR"
 
 echo "Checking healthz..."
 curl --fail --silent --show-error "${BASE_URL}/healthz" | tee "${OUT_DIR}/healthz.json"
+python3 - "${OUT_DIR}/healthz.json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+assert payload["live"] is True
+assert payload["ready"] is True
+for component in ("model", "aligner", "queue"):
+    assert component in payload["components"]
+for group in ("admission", "queue", "memory", "cancellation"):
+    assert group in payload["metrics"]
+assert payload["components"]["model"]["ready"] is True
+assert payload["components"]["queue"]["ready"] is True
+PY
 
 echo
 echo "Checking models..."
@@ -56,6 +70,44 @@ curl --fail --silent --show-error \
   "${BASE_URL}/v1/audio/transcriptions" | tee "${OUT_DIR}/transcription.json"
 
 echo
+echo "Checking verbose timestamp provenance..."
+curl --fail --silent --show-error \
+  -F "file=@${AUDIO_FILE};type=audio/wav" \
+  -F "model=${MODEL}" \
+  -F "response_format=verbose_json" \
+  "${BASE_URL}/v1/audio/transcriptions" | tee "${OUT_DIR}/transcription_verbose.json"
+python3 - "${OUT_DIR}/transcription_verbose.json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+assert "segments" in payload
+assert set(payload["timestamp_provenance"]) == {"segments", "words", "alignment"}
+PY
+
+echo
+echo "Checking plain JSON rejects hidden timestamp requests..."
+TIMESTAMP_STATUS="$(curl --silent --show-error \
+  -o "${OUT_DIR}/plain_json_timestamp_error.json" \
+  -w '%{http_code}' \
+  -F "file=@${AUDIO_FILE};type=audio/wav" \
+  -F "model=${MODEL}" \
+  -F "response_format=json" \
+  -F "word_timestamps=true" \
+  "${BASE_URL}/v1/audio/transcriptions")"
+if [[ "${TIMESTAMP_STATUS}" != "400" ]]; then
+  echo "Expected timestamp request with response_format=json to return 400; got ${TIMESTAMP_STATUS}." >&2
+  exit 1
+fi
+python3 - "${OUT_DIR}/plain_json_timestamp_error.json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+assert "response_format=verbose_json" in payload["detail"]
+PY
+
+echo
 echo "Checking chat completions audio path..."
 AUDIO_BASE64="$(base64 < "$AUDIO_FILE" | tr -d '\n')"
 cat > "${TMPDIR}/chat_request.json" <<EOF
@@ -65,10 +117,6 @@ cat > "${TMPDIR}/chat_request.json" <<EOF
     {
       "role": "user",
       "content": [
-        {
-          "type": "input_text",
-          "text": "Transcribe the attached audio."
-        },
         {
           "type": "input_audio",
           "input_audio": {

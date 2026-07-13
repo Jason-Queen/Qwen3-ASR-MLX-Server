@@ -164,6 +164,7 @@ QWEN_MLX_MODEL_ID=qwen3-asr-mlx
 QWEN_MLX_HOST=127.0.0.1
 QWEN_MLX_PORT=8989
 QWEN_MLX_MAX_UPLOAD_MB=100
+QWEN_MLX_MAX_QUEUE_DEPTH=8
 QWEN_MLX_ALIGNMENT_CHUNK_SECONDS=30
 QWEN_MLX_ALIGNMENT_BOUNDARY_TOLERANCE_SECONDS=5
 QWEN_MLX_AUTO_ALIGN_LANG_CODES=zh,en,ja,ko
@@ -186,8 +187,10 @@ uv run --python 3.11 qwen3-asr-mlx-server --log-prompts
 ## 说明
 
 - 仅支持 `task=transcribe`；`translate` 会被拒绝。
-- 为避免 MLX 原生层在并发下崩溃，单进程内的转录与 forced alignment 推理会串行执行；并发请求会排队而不是并行跑推理。
-- 自动 forced alignment 只会用于可消费时间戳的输出（`verbose_json`、`srt`、`vtt`）或显式时间戳请求；普通 `json`/`text` 请求不会自动对齐。
+- 为避免 MLX 原生层在并发下崩溃，单进程内的转录与 forced alignment 推理会串行执行。每个进程允许 1 个执行中的请求和 `QWEN_MLX_MAX_QUEUE_DEPTH` 个 in-flight 等待请求；超出容量时返回 `429` 与 `Retry-After: 1`。
+- `/healthz` 返回 ASR 模型、可选 aligner、admission/队列 readiness，以及 admission、推理锁等待、解码音频内存、进程 peak RSS 和取消累计指标。必需的 ASR 模型未就绪或 admission 已满时返回 `503`；可选 aligner 不可用会明确显示，但不会阻止纯文本转录。
+- 普通 `json` 与 `text` 是纯文本契约。对这两种格式显式设置 `alignment=on`、`word_timestamps=true` 或 `timestamp_granularities` 时返回 `400`，不会再执行对齐后隐藏结果。JSON 时间戳请使用 `verbose_json`，字幕请使用 `srt`/`vtt`；Chat Completions 仍为纯文本响应并拒绝时间戳输出控制。
+- 自动 forced alignment 只会用于可消费时间戳的输出（`verbose_json`、`srt`、`vtt`）。
 - `zh/en/ja/ko` 的自动 forced alignment 会按运行时依赖自动判定：
   - `zh/en`：需要 aligner 模型可用
   - `ja`：需要 aligner + `nagisa`
@@ -197,6 +200,8 @@ uv run --python 3.11 qwen3-asr-mlx-server --log-prompts
   - `primary_language` 是与 `language` 等值的显式别名
   - `segments[].language` 表示局部分段语种
   - `detected_languages[]` 表示基于分段聚合的语种及时长摘要
+  - `timestamp_provenance` 标明 segment 时间来自 ASR、估算还是 forced alignment，同时给出词时间来源与 alignment 状态
+- 请求若在等待进程内推理锁时取消，会退出等待队列；已经开始的原生 MLX 调用会先完成再删除临时音频，请求仍以取消结束，并按阶段计入指标。
 
 ## 警告
 

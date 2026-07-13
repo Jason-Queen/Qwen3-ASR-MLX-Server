@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import base64
 import binascii
+import contextvars
 import importlib.util
 import io
 import inspect
@@ -22,12 +23,17 @@ import uuid
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - resource is available on supported macOS/Linux hosts
+    resource = None
 
 try:
     from mlx_audio.stt.generate import generate_transcription
@@ -228,6 +234,7 @@ HOST = os.getenv("QWEN_MLX_HOST", "127.0.0.1")
 PORT = int(os.getenv("QWEN_MLX_PORT", "8989"))
 MAX_UPLOAD_MB = int(os.getenv("QWEN_MLX_MAX_UPLOAD_MB", "100"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+MAX_QUEUE_DEPTH = max(0, int(os.getenv("QWEN_MLX_MAX_QUEUE_DEPTH", "8")))
 LOG_LEVEL = os.getenv("QWEN_MLX_LOG_LEVEL", "INFO").upper()
 LOG_PROMPTS = os.getenv("QWEN_MLX_LOG_PROMPTS", "0").strip().lower() in {
     "1",
@@ -247,6 +254,7 @@ logger = logging.getLogger("qwen3_asr_api")
 
 SUPPORTED_RESPONSE_FORMATS = {"json", "text", "verbose_json", "srt", "vtt"}
 AUTO_ALIGNMENT_RESPONSE_FORMATS = {"verbose_json", "srt", "vtt"}
+SUPPORTED_TIMESTAMP_GRANULARITIES = {"word", "segment"}
 MIME_TO_SUFFIX = {
     "audio/wav": ".wav",
     "audio/x-wav": ".wav",
@@ -345,9 +353,322 @@ class TranscriptionResult:
     segments: list[dict[str, Any]]
     duration: float | None
     words: list[dict[str, Any]] = field(default_factory=list)
+    segment_timestamp_source: str = "asr"
+    word_timestamp_source: str | None = None
+    alignment_status: str = "not_requested"
 
 
-_GLOBAL_INFERENCE_LOCK = Lock()
+_CURRENT_REQUEST_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "qwen_mlx_request_id",
+    default=None,
+)
+_CURRENT_CANCELLATION_EVENT: contextvars.ContextVar[Event | None] = contextvars.ContextVar(
+    "qwen_mlx_cancellation_event",
+    default=None,
+)
+
+
+class InferenceWaitCancelled(RuntimeError):
+    """Raised inside a worker thread when its queued request was cancelled."""
+
+
+def _process_peak_rss_bytes() -> int | None:
+    if resource is None:
+        return None
+    try:
+        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (AttributeError, OSError, ValueError):
+        return None
+    # Linux reports KiB; macOS reports bytes.
+    if sys.platform.startswith("linux"):
+        value *= 1024
+    return max(0, value)
+
+
+class InstrumentedInferenceLock:
+    """Process-local inference lock with observable, cancellable waiters."""
+
+    def __init__(self, poll_interval_seconds: float = 0.05) -> None:
+        self._lock = Lock()
+        self._state_lock = Lock()
+        self._poll_interval_seconds = max(0.005, poll_interval_seconds)
+        self._waiting = 0
+        self._active = 0
+        self._peak_waiting = 0
+        self._acquisitions_total = 0
+        self._waited_acquisitions_total = 0
+        self._completed_total = 0
+        self._cancelled_waiters_total = 0
+        self._wait_seconds_total = 0.0
+        self._wait_seconds_max = 0.0
+        self._waiting_request_ids: set[str] = set()
+        self._active_request_id: str | None = None
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        request_id = _CURRENT_REQUEST_ID.get()
+        cancellation_event = _CURRENT_CANCELLATION_EVENT.get()
+        started = time.perf_counter()
+
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise InferenceWaitCancelled("request cancelled before inference admission")
+
+        if not blocking:
+            acquired = self._lock.acquire(blocking=False)
+            if acquired:
+                self._record_acquired(request_id, 0.0)
+            return acquired
+
+        # Do not count an uncontended acquisition as a queued waiter.
+        acquired = self._lock.acquire(blocking=False)
+        if acquired:
+            if cancellation_event is not None and cancellation_event.is_set():
+                self._lock.release()
+                raise InferenceWaitCancelled("request cancelled before inference started")
+            self._record_acquired(request_id, 0.0)
+            return True
+
+        if timeout == 0:
+            return False
+
+        with self._state_lock:
+            self._waiting += 1
+            self._peak_waiting = max(self._peak_waiting, self._waiting)
+            if request_id:
+                self._waiting_request_ids.add(request_id)
+
+        acquired = False
+        deadline = None if timeout is None or timeout < 0 else started + timeout
+        cancelled = False
+        try:
+            while True:
+                if cancellation_event is not None and cancellation_event.is_set():
+                    cancelled = True
+                    raise InferenceWaitCancelled("request cancelled while waiting for inference")
+
+                if cancellation_event is None and deadline is None:
+                    acquired = self._lock.acquire()
+                else:
+                    interval = self._poll_interval_seconds
+                    if deadline is not None:
+                        remaining = deadline - time.perf_counter()
+                        if remaining <= 0:
+                            return False
+                        interval = min(interval, remaining)
+                    acquired = self._lock.acquire(timeout=interval)
+
+                if acquired:
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        self._lock.release()
+                        acquired = False
+                        cancelled = True
+                        raise InferenceWaitCancelled(
+                            "request cancelled while acquiring inference"
+                        )
+                    break
+        finally:
+            with self._state_lock:
+                self._waiting = max(0, self._waiting - 1)
+                if request_id:
+                    self._waiting_request_ids.discard(request_id)
+                if cancelled:
+                    self._cancelled_waiters_total += 1
+
+        if acquired and cancellation_event is not None and cancellation_event.is_set():
+            self._lock.release()
+            with self._state_lock:
+                self._cancelled_waiters_total += 1
+            raise InferenceWaitCancelled("request cancelled before inference started")
+
+        if acquired:
+            self._record_acquired(request_id, time.perf_counter() - started)
+        return acquired
+
+    def _record_acquired(self, request_id: str | None, wait_seconds: float) -> None:
+        with self._state_lock:
+            self._active = 1
+            self._active_request_id = request_id
+            self._acquisitions_total += 1
+            if wait_seconds > 0:
+                self._waited_acquisitions_total += 1
+            self._wait_seconds_total += wait_seconds
+            self._wait_seconds_max = max(self._wait_seconds_max, wait_seconds)
+
+    def release(self) -> None:
+        with self._state_lock:
+            self._lock.release()
+            self._active = 0
+            self._active_request_id = None
+            self._completed_total += 1
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def phase_for(self, request_id: str) -> str | None:
+        with self._state_lock:
+            if request_id == self._active_request_id:
+                return "running"
+            if request_id in self._waiting_request_ids:
+                return "queued"
+        return None
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._state_lock:
+            acquisitions = self._acquisitions_total
+            waited_acquisitions = self._waited_acquisitions_total
+            wait_total = self._wait_seconds_total
+            return {
+                "active": self._active,
+                "waiting": self._waiting,
+                "peak_waiting": self._peak_waiting,
+                "acquisitions_total": acquisitions,
+                "waited_acquisitions_total": waited_acquisitions,
+                "completed_total": self._completed_total,
+                "cancelled_waiters_total": self._cancelled_waiters_total,
+                "wait_seconds_total": round(wait_total, 6),
+                "wait_seconds_max": round(self._wait_seconds_max, 6),
+                "wait_seconds_average": round(wait_total / waited_acquisitions, 6)
+                if waited_acquisitions
+                else 0.0,
+            }
+
+    def __enter__(self) -> InstrumentedInferenceLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback_value: Any) -> None:
+        self.release()
+
+
+class AdmissionLease:
+    def __init__(self, metrics: RuntimeMetrics, request_id: str) -> None:
+        self._metrics = metrics
+        self.request_id = request_id
+        self.audio_bytes = 0
+        self._finished = False
+
+    def set_audio_bytes(self, value: int) -> None:
+        self._metrics.set_audio_bytes(self, value)
+
+    def finish(self, outcome: str) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self._metrics.finish(self, outcome)
+
+
+class RuntimeMetrics:
+    """Thread-safe per-process request, memory, and cancellation counters."""
+
+    def __init__(self, max_queue_depth: int) -> None:
+        self.max_queue_depth = max(0, max_queue_depth)
+        self.capacity = self.max_queue_depth + 1
+        self._lock = Lock()
+        self._attempts_total = 0
+        self._admitted_total = 0
+        self._rejected_total = 0
+        self._in_flight = 0
+        self._peak_in_flight = 0
+        self._completed_total = 0
+        self._failed_total = 0
+        self._cancelled_total = 0
+        self._active_audio_bytes = 0
+        self._peak_active_audio_bytes = 0
+        self._decoded_audio_bytes_total = 0
+        self._largest_request_audio_bytes = 0
+        self._cancellation_phases = {
+            "request": 0,
+            "processing": 0,
+            "queued": 0,
+            "running": 0,
+        }
+        self._pending_cancellation_phases: dict[str, str] = {}
+        self._client_disconnect_total = 0
+
+    def try_admit(self, request_id: str) -> AdmissionLease | None:
+        with self._lock:
+            self._attempts_total += 1
+            if self._in_flight >= self.capacity:
+                self._rejected_total += 1
+                return None
+            self._admitted_total += 1
+            self._in_flight += 1
+            self._peak_in_flight = max(self._peak_in_flight, self._in_flight)
+        return AdmissionLease(self, request_id)
+
+    def set_audio_bytes(self, lease: AdmissionLease, value: int) -> None:
+        normalized = max(0, int(value))
+        with self._lock:
+            delta = normalized - lease.audio_bytes
+            lease.audio_bytes = normalized
+            self._active_audio_bytes = max(0, self._active_audio_bytes + delta)
+            if delta > 0:
+                self._decoded_audio_bytes_total += delta
+            self._peak_active_audio_bytes = max(
+                self._peak_active_audio_bytes,
+                self._active_audio_bytes,
+            )
+            self._largest_request_audio_bytes = max(
+                self._largest_request_audio_bytes,
+                normalized,
+            )
+
+    def note_cancellation_phase(self, request_id: str, phase: str) -> None:
+        normalized = phase if phase in self._cancellation_phases else "processing"
+        with self._lock:
+            self._pending_cancellation_phases.setdefault(request_id, normalized)
+
+    def note_client_disconnect(self) -> None:
+        with self._lock:
+            self._client_disconnect_total += 1
+
+    def finish(self, lease: AdmissionLease, outcome: str) -> None:
+        with self._lock:
+            self._active_audio_bytes = max(0, self._active_audio_bytes - lease.audio_bytes)
+            self._in_flight = max(0, self._in_flight - 1)
+            if outcome == "completed":
+                self._completed_total += 1
+            elif outcome == "cancelled":
+                self._cancelled_total += 1
+                phase = self._pending_cancellation_phases.pop(lease.request_id, "request")
+                self._cancellation_phases[phase] += 1
+            else:
+                self._failed_total += 1
+                self._pending_cancellation_phases.pop(lease.request_id, None)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "admission": {
+                    "capacity": self.capacity,
+                    "max_queue_depth": self.max_queue_depth,
+                    "in_flight": self._in_flight,
+                    "peak_in_flight": self._peak_in_flight,
+                    "attempts_total": self._attempts_total,
+                    "admitted_total": self._admitted_total,
+                    "rejected_total": self._rejected_total,
+                    "completed_total": self._completed_total,
+                    "failed_total": self._failed_total,
+                },
+                "memory": {
+                    "active_audio_bytes": self._active_audio_bytes,
+                    "peak_active_audio_bytes": self._peak_active_audio_bytes,
+                    "decoded_audio_bytes_total": self._decoded_audio_bytes_total,
+                    "largest_request_audio_bytes": self._largest_request_audio_bytes,
+                    "process_peak_rss_bytes": _process_peak_rss_bytes(),
+                },
+                "cancellation": {
+                    "cancelled_requests_total": self._cancelled_total,
+                    "request_total": self._cancellation_phases["request"],
+                    "processing_total": self._cancellation_phases["processing"],
+                    "queued_total": self._cancellation_phases["queued"],
+                    "running_total": self._cancellation_phases["running"],
+                    "client_disconnect_total": self._client_disconnect_total,
+                },
+            }
+
+
+_GLOBAL_INFERENCE_LOCK = InstrumentedInferenceLock()
+runtime_metrics = RuntimeMetrics(MAX_QUEUE_DEPTH)
 
 
 class MLXTranscriber:
@@ -401,6 +722,16 @@ class MLXTranscriber:
 
     def last_error(self) -> str | None:
         return self._load_error
+
+    def readiness_snapshot(self) -> dict[str, Any]:
+        validation_error = _asset_dir_validation_error(Path(self.model_path))
+        ready = self._model is not None
+        return {
+            "ready": ready,
+            "loaded": ready,
+            "available": validation_error is None,
+            "error": None if ready else self._load_error or validation_error or "not loaded",
+        }
 
     def transcribe(
         self,
@@ -511,6 +842,16 @@ class MLXAligner:
 
     def last_error(self) -> str | None:
         return self._load_error
+
+    def readiness_snapshot(self) -> dict[str, Any]:
+        validation_error = _asset_dir_validation_error(Path(self.model_path))
+        ready = self._model is not None
+        return {
+            "ready": ready,
+            "loaded": ready,
+            "available": validation_error is None,
+            "error": None if ready else self._load_error or validation_error or "not loaded",
+        }
 
     def supported_languages(self) -> set[str] | None:
         self.load(strict=False)
@@ -881,11 +1222,14 @@ def _normalize_result(
     text: str | None = None
     raw_language: Any = None
     segments: list[dict[str, Any]] = []
+    segment_timestamp_source = "none"
 
     if isinstance(raw_result, dict):
         text = _coalesce_text(raw_result)
         raw_language = raw_result.get("language")
         segments = _normalize_segments(raw_result.get("segments") or raw_result.get("chunks"))
+        if segments:
+            segment_timestamp_source = "asr"
 
     elif isinstance(raw_result, str):
         text = raw_result.strip()
@@ -901,6 +1245,8 @@ def _normalize_result(
         segments = _normalize_segments(
             getattr(raw_result, "segments", None) or getattr(raw_result, "chunks", None)
         )
+        if segments:
+            segment_timestamp_source = "asr"
 
     if not text:
         try:
@@ -917,6 +1263,7 @@ def _normalize_result(
     if not segments and text:
         approx_duration = max(1.0, len(text) / 12.0)
         segments = [{"id": 0, "start": 0.0, "end": approx_duration, "text": text}]
+        segment_timestamp_source = "estimated"
 
     duration = max((seg.get("end", 0.0) for seg in segments), default=0.0)
 
@@ -931,6 +1278,7 @@ def _normalize_result(
         language=language,
         segments=segments,
         duration=duration,
+        segment_timestamp_source=segment_timestamp_source,
     )
 
 
@@ -1258,7 +1606,13 @@ def _normalize_timestamp_granularities(value: Any) -> list[str]:
     else:
         items = [str(value).strip()]
 
-    return [item.lower() for item in items if item]
+    aliases = {"words": "word", "segments": "segment"}
+    normalized: list[str] = []
+    for item in items:
+        candidate = aliases.get(item.lower(), item.lower())
+        if candidate and candidate not in normalized:
+            normalized.append(candidate)
+    return normalized
 
 
 def _timestamp_requests_alignment(granularities: list[str] | None) -> bool:
@@ -1266,6 +1620,47 @@ def _timestamp_requests_alignment(granularities: list[str] | None) -> bool:
         return False
     normalized = {item.lower() for item in granularities}
     return bool(normalized & {"word", "words", "segment", "segments"})
+
+
+def _validate_timestamp_response_contract(
+    *,
+    response_format: str,
+    alignment_mode: str,
+    timestamp_granularities: list[str] | None,
+    chat_response: bool = False,
+) -> None:
+    granularities = timestamp_granularities or []
+    unsupported = sorted(set(granularities) - SUPPORTED_TIMESTAMP_GRANULARITIES)
+    if unsupported:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported timestamp granularities: {', '.join(unsupported)}. "
+                "Supported: segment, word."
+            ),
+        )
+
+    timestamps_requested = bool(granularities) or alignment_mode == "on"
+    if not timestamps_requested:
+        return
+
+    if chat_response:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Chat Completions returns transcript text only and cannot expose timestamps. "
+                "Use /v1/audio/transcriptions with response_format=verbose_json."
+            ),
+        )
+
+    if response_format in {"json", "text"}:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"response_format={response_format} cannot expose timestamps. "
+                "Use response_format=verbose_json for JSON timestamps, or srt/vtt for subtitles."
+            ),
+        )
 
 
 def _parse_alignment_mode(value: Any) -> str:
@@ -2317,6 +2712,11 @@ def _build_transcription_response(result: TranscriptionResult, response_format: 
             "primary_language": primary_language,
             "duration": result.duration,
             "text": result.text,
+            "timestamp_provenance": {
+                "segments": result.segment_timestamp_source,
+                "words": result.word_timestamp_source,
+                "alignment": result.alignment_status,
+            },
             "segments": [
                 {
                     "id": segment["id"],
@@ -2852,6 +3252,52 @@ def _transcode_with_ffmpeg(input_path: str) -> tuple[str | None, str | None]:
     return None, stderr or "ffmpeg failed without stderr"
 
 
+async def _run_blocking_safely(
+    request_id: str,
+    func: Any,
+    *args: Any,
+) -> Any:
+    """Run native work without deleting its inputs while cancellation is unwinding."""
+
+    cancellation_event = Event()
+    request_token = _CURRENT_REQUEST_ID.set(request_id)
+    cancellation_token = _CURRENT_CANCELLATION_EVENT.set(cancellation_event)
+    worker = asyncio.create_task(asyncio.to_thread(func, *args))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        phase = _GLOBAL_INFERENCE_LOCK.phase_for(request_id) or "processing"
+        runtime_metrics.note_cancellation_phase(request_id, phase)
+        cancellation_event.set()
+
+        # A queued inference can now leave the instrumented lock. Native work that
+        # has already started is not safely interruptible, so keep its files alive
+        # until the worker exits and then propagate the request cancellation.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+
+        if not worker.cancelled():
+            try:
+                worker.result()
+            except InferenceWaitCancelled:
+                pass
+            except Exception as exc:
+                logger.warning(
+                    "[%s] blocking operation finished with error after cancellation: %s",
+                    request_id,
+                    exc,
+                )
+        raise
+    finally:
+        _CURRENT_CANCELLATION_EVENT.reset(cancellation_token)
+        _CURRENT_REQUEST_ID.reset(request_token)
+
+
 async def _run_transcription_pipeline(
     *,
     request_id: str,
@@ -2899,8 +3345,10 @@ async def _run_transcription_pipeline(
             ffmpeg_error = "none"
             ffmpeg_status = "skipped"
         else:
-            converted_audio_path, ffmpeg_error = await asyncio.to_thread(
-                _transcode_with_ffmpeg, audio_path
+            converted_audio_path, ffmpeg_error = await _run_blocking_safely(
+                request_id,
+                _transcode_with_ffmpeg,
+                audio_path,
             )
             infer_audio_path = converted_audio_path or audio_path
             ffmpeg_status = "ok" if converted_audio_path else "failed"
@@ -2913,7 +3361,8 @@ async def _run_transcription_pipeline(
             infer_audio_path,
         )
 
-        result = await asyncio.to_thread(
+        result = await _run_blocking_safely(
+            request_id,
             transcriber.transcribe,
             infer_audio_path,
             language,
@@ -2925,6 +3374,7 @@ async def _run_transcription_pipeline(
         audio_duration_sec = wav_duration_sec or result.duration
         detected_language_code = _finalize_result_language(language, result)
         auto_align_lang_codes = _effective_auto_align_lang_codes(aligner)
+        result.alignment_status = "disabled" if alignment_mode == "off" else "not_requested"
         should_align = _compute_alignment_enabled(
             alignment_mode=alignment_mode,
             timestamps_requested=timestamps_requested,
@@ -2932,6 +3382,17 @@ async def _run_transcription_pipeline(
             detected_language_code=detected_language_code,
             auto_align_lang_codes=auto_align_lang_codes,
         )
+        if (
+            not should_align
+            and alignment_mode == "auto"
+            and response_format in AUTO_ALIGNMENT_RESPONSE_FORMATS
+        ):
+            if aligner._model is None:
+                result.alignment_status = "unavailable"
+            elif detected_language_code is None:
+                result.alignment_status = "unknown_language"
+            else:
+                result.alignment_status = "unsupported_language"
         logger.info(
             "[%s] alignment_mode=%s response_format=%s timestamps_requested=%s detected_lang=%s "
             "auto_align_langs=%s should_align=%s",
@@ -2945,6 +3406,7 @@ async def _run_transcription_pipeline(
         )
 
         if should_align:
+            result.alignment_status = "requested"
             if not aligner.is_ready():
                 aligner_error = aligner.last_error() or "aligner not initialized"
                 if alignment_mode == "on" or timestamps_requested:
@@ -2956,6 +3418,7 @@ async def _run_transcription_pipeline(
                             f"{_manual_model_setup_help('QWEN_MLX_ALIGNER_PATH')}"
                         ),
                     )
+                result.alignment_status = "unavailable"
                 logger.warning("[%s] Alignment skipped: %s", request_id, aligner_error)
             else:
                 if _should_rechunk_segments_for_alignment(
@@ -2970,7 +3433,8 @@ async def _run_transcription_pipeline(
                     )
                     rechunk_options = dict(decode_options)
                     rechunk_options["chunk_duration"] = ALIGNMENT_CHUNK_SECONDS
-                    result = await asyncio.to_thread(
+                    result = await _run_blocking_safely(
+                        request_id,
                         transcriber.transcribe,
                         infer_audio_path,
                         language,
@@ -2990,10 +3454,12 @@ async def _run_transcription_pipeline(
                             status_code=400,
                             detail=f"Forced alignment requested but {missing_dep}.",
                         )
+                    result.alignment_status = "unavailable"
                     logger.warning("[%s] Alignment skipped: %s", request_id, missing_dep)
                     return result
                 try:
-                    aligned_words = await asyncio.to_thread(
+                    aligned_words = await _run_blocking_safely(
+                        request_id,
                         _apply_alignment,
                         aligner,
                         infer_audio_path,
@@ -3008,6 +3474,7 @@ async def _run_transcription_pipeline(
                             status_code=500,
                             detail=f"Forced alignment failed: {align_exc}",
                         ) from align_exc
+                    result.alignment_status = "failed"
                     logger.warning(
                         "[%s] Forced alignment skipped after error: %s",
                         request_id,
@@ -3015,6 +3482,8 @@ async def _run_transcription_pipeline(
                     )
                 else:
                     result.words = aligned_words
+                    result.word_timestamp_source = "forced_alignment" if aligned_words else None
+                    result.alignment_status = "applied" if aligned_words else "empty"
                     if SEGMENT_REBUILD_FROM_WORDS and aligned_words:
                         source_segments = [dict(segment) for segment in result.segments]
                         rebuilt_segments = _rebuild_segments_from_words(
@@ -3028,6 +3497,7 @@ async def _run_transcription_pipeline(
                                 rebuilt_segments,
                             )
                             result.segments = rebuilt_segments
+                            result.segment_timestamp_source = "forced_alignment"
                             logger.info(
                                 "[%s] sentence_segments=on segments_rebuilt=%d",
                                 request_id,
@@ -3103,10 +3573,86 @@ async def _run_transcription_pipeline(
                 pass
 
 
+_ADMISSION_PATHS = {
+    "/v1/audio/transcriptions",
+    "/audio/transcriptions",
+    "/v1/chat/completions",
+    "/chat/completions",
+}
+
+
+class AdmissionMetricsMiddleware:
+    """Bound transcription work before request bodies are materialized."""
+
+    def __init__(self, app: Any, metrics: RuntimeMetrics) -> None:
+        self.app = app
+        self.metrics = metrics
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if (
+            scope.get("type") != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") not in _ADMISSION_PATHS
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        request_id = uuid.uuid4().hex[:8]
+        lease = self.metrics.try_admit(request_id)
+        if lease is None:
+            response = JSONResponse(
+                status_code=429,
+                content={
+                    "detail": (
+                        "Transcription admission capacity is full. "
+                        "Retry after an in-flight request completes."
+                    )
+                },
+                headers={"Retry-After": "1"},
+            )
+            await response(scope, receive, send)
+            return
+
+        state = scope.setdefault("state", {})
+        state["request_id"] = request_id
+        state["admission_lease"] = lease
+        status_code: int | None = None
+        disconnect_observed = False
+
+        async def receive_with_disconnect_metrics() -> dict[str, Any]:
+            nonlocal disconnect_observed
+            message = await receive()
+            if message.get("type") == "http.disconnect" and not disconnect_observed:
+                disconnect_observed = True
+                self.metrics.note_client_disconnect()
+            return message
+
+        async def send_with_status_metrics(message: dict[str, Any]) -> None:
+            nonlocal status_code
+            if message.get("type") == "http.response.start":
+                status_code = int(message.get("status", 500))
+            await send(message)
+
+        outcome = "failed"
+        try:
+            await self.app(
+                scope,
+                receive_with_disconnect_metrics,
+                send_with_status_metrics,
+            )
+            outcome = "completed" if status_code is not None and status_code < 400 else "failed"
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        finally:
+            lease.finish(outcome)
+
+
 transcriber = MLXTranscriber(model_path=MODEL_PATH)
 aligner = MLXAligner(model_path=ALIGNER_PATH)
-app = FastAPI(title="Qwen3-ASR-MLX-Server", version="1.1.0")
+app = FastAPI(title="Qwen3-ASR-MLX-Server", version="1.2.0")
 
+app.add_middleware(AdmissionMetricsMiddleware, metrics=runtime_metrics)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -3136,9 +3682,51 @@ async def startup_event() -> None:
         )
 
 
+def _health_snapshot() -> tuple[dict[str, Any], int]:
+    model_state = {
+        "required": True,
+        "model_id": MODEL_ID,
+        **transcriber.readiness_snapshot(),
+    }
+    aligner_state = {
+        "required": False,
+        "configured_languages": sorted(AUTO_ALIGN_LANG_CODES),
+        **aligner.readiness_snapshot(),
+    }
+    metrics = runtime_metrics.snapshot()
+    queue_metrics = _GLOBAL_INFERENCE_LOCK.snapshot()
+    metrics["queue"] = queue_metrics
+
+    admission = metrics["admission"]
+    queue_ready = admission["in_flight"] < admission["capacity"]
+    queue_state = {
+        "ready": queue_ready,
+        "accepting": queue_ready,
+        "capacity": admission["capacity"],
+        "max_queue_depth": admission["max_queue_depth"],
+        "in_flight": admission["in_flight"],
+        "active_inference": queue_metrics["active"],
+        "waiting_for_inference": queue_metrics["waiting"],
+    }
+    ready = bool(model_state["ready"] and queue_ready)
+    payload = {
+        "status": "ok" if ready else "unavailable",
+        "live": True,
+        "ready": ready,
+        "components": {
+            "model": model_state,
+            "aligner": aligner_state,
+            "queue": queue_state,
+        },
+        "metrics": metrics,
+    }
+    return payload, 200 if ready else 503
+
+
 @app.get("/healthz")
-async def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+async def healthz() -> Response:
+    payload, status_code = _health_snapshot()
+    return JSONResponse(content=payload, status_code=status_code)
 
 
 @app.get("/v1/models")
@@ -3187,7 +3775,7 @@ async def transcriptions(
         alias="timestamp_granularities[]",
     ),
 ) -> Response:
-    request_id = uuid.uuid4().hex[:8]
+    request_id = getattr(request.state, "request_id", None) or uuid.uuid4().hex[:8]
     _validate_task(task)
     requested_model_name = _normalize_requested_model_name(model)
 
@@ -3243,6 +3831,11 @@ async def transcriptions(
     )
 
     if file is not None:
+        _validate_timestamp_response_contract(
+            response_format=response_format,
+            alignment_mode=alignment_mode,
+            timestamp_granularities=timestamp_granularities,
+        )
         audio_bytes = await file.read()
         file_name = file.filename or file_name
 
@@ -3260,7 +3853,6 @@ async def transcriptions(
                 detail="Missing required field: file (multipart) or audio_file (json)",
             )
 
-        audio_bytes, file_name = _parse_audio_file_payload(audio_spec, payload)
         decode_options = _apply_json_decode_options(decode_options, payload)
 
         language = language or payload.get("language")
@@ -3292,11 +3884,21 @@ async def transcriptions(
                         f"Supported: {', '.join(sorted(SUPPORTED_RESPONSE_FORMATS))}"
                     ),
                 )
+        _validate_timestamp_response_contract(
+            response_format=response_format,
+            alignment_mode=alignment_mode,
+            timestamp_granularities=timestamp_granularities,
+        )
+        audio_bytes, file_name = _parse_audio_file_payload(audio_spec, payload)
     else:
         raise HTTPException(
             status_code=400,
             detail="Missing required form field: file",
         )
+
+    admission_lease = getattr(request.state, "admission_lease", None)
+    if isinstance(admission_lease, AdmissionLease):
+        admission_lease.set_audio_bytes(len(audio_bytes))
 
     logger.info(
         "[%s] request_params model=%s language=%s response_format=%s alignment_mode=%s "
@@ -3336,13 +3938,12 @@ async def chat_completions(request: Request) -> Response:
         raise HTTPException(status_code=400, detail="chat/completions only supports JSON payload")
 
     payload = await request.json()
-    request_id = uuid.uuid4().hex[:8]
+    request_id = getattr(request.state, "request_id", None) or uuid.uuid4().hex[:8]
     user_agent = request.headers.get("user-agent", "") or "unknown"
     client_host = request.client.host if request.client else "unknown"
 
     _validate_task(payload.get("task"))
     model = _normalize_requested_model_name(payload.get("model"))
-    canonical_model = _ensure_transcriber_ready_or_raise(model)
     language = payload.get("language")
     prompt = payload.get("prompt") or payload.get("context")
     if isinstance(prompt, str):
@@ -3361,6 +3962,13 @@ async def chat_completions(request: Request) -> Response:
     timestamp_granularities = _normalize_timestamp_granularities(
         payload.get("timestamp_granularities") or payload.get("timestamp_granularities[]")
     )
+    _validate_timestamp_response_contract(
+        response_format="json",
+        alignment_mode=alignment_mode,
+        timestamp_granularities=timestamp_granularities,
+        chat_response=True,
+    )
+    canonical_model = _ensure_transcriber_ready_or_raise(model)
 
     audio_bytes, file_name, chat_prompt = _extract_chat_audio(payload)
     if not audio_bytes:
@@ -3373,6 +3981,10 @@ async def chat_completions(request: Request) -> Response:
         )
     if not prompt:
         prompt = chat_prompt
+
+    admission_lease = getattr(request.state, "admission_lease", None)
+    if isinstance(admission_lease, AdmissionLease):
+        admission_lease.set_audio_bytes(len(audio_bytes))
 
     logger.info(
         "[%s] POST /v1/chat/completions client=%s user_agent=%s model=%s language=%s "

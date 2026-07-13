@@ -162,6 +162,7 @@ QWEN_MLX_MODEL_ID=qwen3-asr-mlx
 QWEN_MLX_HOST=127.0.0.1
 QWEN_MLX_PORT=8989
 QWEN_MLX_MAX_UPLOAD_MB=100
+QWEN_MLX_MAX_QUEUE_DEPTH=8
 QWEN_MLX_ALIGNMENT_CHUNK_SECONDS=30
 QWEN_MLX_ALIGNMENT_BOUNDARY_TOLERANCE_SECONDS=5
 QWEN_MLX_AUTO_ALIGN_LANG_CODES=zh,en,ja,ko
@@ -184,8 +185,10 @@ Chunk size tuning guidance:
 ## Notes
 
 - `task=transcribe` is supported; `translate` is rejected.
-- To avoid native MLX crashes under load, transcription and forced alignment inference stay serialized inside a single process; concurrent requests queue instead of running inference in parallel.
-- Auto forced-alignment runs only for timestamp-capable outputs (`verbose_json`, `srt`, `vtt`) or explicit timestamp requests. Plain `json`/`text` requests do not auto-align.
+- To avoid native MLX crashes under load, transcription and forced alignment inference stay serialized inside a single process. Admission allows one executing request plus `QWEN_MLX_MAX_QUEUE_DEPTH` in-flight waiters per process; excess requests receive `429` with `Retry-After: 1`.
+- `/healthz` returns model, optional-aligner, and admission/queue readiness plus cumulative admission, inference-wait, decoded-audio memory, process peak-RSS, and cancellation metrics. It returns `503` when the required ASR model is not ready or admission is full; an unavailable optional aligner is reported without disabling text-only transcription.
+- Plain `json` and `text` are text-only contracts. Explicit `alignment=on`, `word_timestamps=true`, or `timestamp_granularities` with either format returns `400` instead of performing alignment and hiding the result. Use `verbose_json` for JSON timestamps, or `srt`/`vtt` for subtitles. Chat Completions remains text-only and rejects timestamp output controls.
+- Auto forced-alignment runs only for timestamp-capable outputs (`verbose_json`, `srt`, `vtt`).
 - Auto forced-alignment for `zh/en/ja/ko` is runtime-gated by aligner/dependencies:
   - `zh/en`: aligner model must be ready
   - `ja`: aligner + `nagisa`
@@ -195,6 +198,8 @@ Chunk size tuning guidance:
   - `primary_language` is an explicit alias of `language`
   - `segments[].language` represents per-segment language
   - `detected_languages[]` summarizes detected languages and durations from segments
+  - `timestamp_provenance` identifies ASR, estimated, or forced-alignment segment timing; word timing source; and alignment status
+- A request cancelled while waiting for the process-local inference lock leaves the wait queue. Native MLX work that has already started is allowed to finish before temporary audio is deleted; the request still completes as cancelled and is counted by phase.
 
 ## Warning
 

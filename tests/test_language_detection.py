@@ -81,6 +81,14 @@ class LanguageDetectionTests(unittest.TestCase):
 
         self.assertEqual(payload["language"], "zh")
         self.assertEqual(payload["primary_language"], "zh")
+        self.assertEqual(
+            payload["timestamp_provenance"],
+            {
+                "segments": "asr",
+                "words": None,
+                "alignment": "not_requested",
+            },
+        )
         self.assertEqual(payload["segments"][0]["language"], "zh")
         self.assertEqual(payload["segments"][1]["language"], "en")
         self.assertEqual(payload["segments"][2]["language"], "yue")
@@ -108,6 +116,30 @@ class LanguageDetectionTests(unittest.TestCase):
         self.assertEqual(payload["primary_language"], "en")
         self.assertNotIn("language", payload["segments"][0])
         self.assertEqual(payload["detected_languages"], [{"code": "en", "duration": 2.0}])
+
+    def test_verbose_json_reports_forced_alignment_timestamp_provenance(self) -> None:
+        result = TranscriptionResult(
+            text="Hello",
+            language="en",
+            segments=[{"id": 0, "start": 0.0, "end": 0.5, "text": "Hello"}],
+            duration=0.5,
+            words=[{"word": "Hello", "start": 0.0, "end": 0.5}],
+            segment_timestamp_source="forced_alignment",
+            word_timestamp_source="forced_alignment",
+            alignment_status="applied",
+        )
+
+        response = _build_transcription_response(result, "verbose_json")
+        payload = json.loads(response.body)
+
+        self.assertEqual(
+            payload["timestamp_provenance"],
+            {
+                "segments": "forced_alignment",
+                "words": "forced_alignment",
+                "alignment": "applied",
+            },
+        )
 
     def test_restore_segment_languages_from_overlap_uses_dominant_source_language(self) -> None:
         source_segments = [

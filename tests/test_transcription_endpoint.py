@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import tempfile
 import unittest
@@ -15,7 +16,7 @@ class MultipartTranscriptionEndpointTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(server.app)
 
-    def _post_with_form(self, data: dict[str, str]) -> tuple[int, dict[str, object]]:
+    def _post_with_form(self, data: dict[str, str]) -> tuple[object, dict[str, object]]:
         captured: dict[str, object] = {}
 
         async def fake_pipeline(**kwargs: object) -> server.TranscriptionResult:
@@ -45,36 +46,156 @@ class MultipartTranscriptionEndpointTests(unittest.TestCase):
                 files={"file": ("audio.wav", b"fake audio", "audio/wav")},
             )
 
-        return response.status_code, captured
+        return response, captured
 
     def test_multipart_word_timestamps_enables_alignment(self) -> None:
-        status_code, captured = self._post_with_form({"word_timestamps": "true"})
+        response, captured = self._post_with_form(
+            {
+                "response_format": "verbose_json",
+                "word_timestamps": "true",
+            }
+        )
 
-        self.assertEqual(status_code, 200)
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["alignment_mode"], "on")
 
     def test_multipart_word_timestamps_can_disable_alignment(self) -> None:
-        status_code, captured = self._post_with_form({"word_timestamps": "false"})
+        response, captured = self._post_with_form({"word_timestamps": "false"})
 
-        self.assertEqual(status_code, 200)
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["alignment_mode"], "off")
 
     def test_multipart_alignment_overrides_word_timestamps(self) -> None:
-        status_code, captured = self._post_with_form(
+        response, captured = self._post_with_form(
             {
                 "alignment": "off",
                 "word_timestamps": "true",
             }
         )
 
-        self.assertEqual(status_code, 200)
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["alignment_mode"], "off")
 
     def test_multipart_response_format_is_forwarded_to_pipeline(self) -> None:
-        status_code, captured = self._post_with_form({"response_format": "verbose_json"})
+        response, captured = self._post_with_form({"response_format": "verbose_json"})
 
-        self.assertEqual(status_code, 200)
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["response_format"], "verbose_json")
+
+    def test_plain_json_rejects_word_timestamps_instead_of_hiding_them(self) -> None:
+        response, captured = self._post_with_form({"word_timestamps": "true"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("response_format=verbose_json", response.json()["detail"])
+        self.assertEqual(captured, {})
+
+    def test_plain_json_rejects_timestamp_granularities(self) -> None:
+        response, captured = self._post_with_form(
+            {"timestamp_granularities[]": "word"}
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("cannot expose timestamps", response.json()["detail"])
+        self.assertEqual(captured, {})
+
+
+class JsonTimestampEndpointTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = TestClient(server.app)
+
+    def _post_transcription(
+        self,
+        values: dict[str, object],
+    ) -> tuple[object, dict[str, object]]:
+        captured: dict[str, object] = {}
+
+        async def fake_pipeline(**kwargs: object) -> server.TranscriptionResult:
+            captured.update(kwargs)
+            return server.TranscriptionResult(
+                text="hello",
+                language="en",
+                segments=[{"id": 0, "start": 0.0, "end": 0.5, "text": "hello"}],
+                duration=0.5,
+                words=[{"word": "hello", "start": 0.0, "end": 0.5}],
+                segment_timestamp_source="forced_alignment",
+                word_timestamp_source="forced_alignment",
+                alignment_status="applied",
+            )
+
+        payload = {
+            "model": "qwen3-asr-mlx",
+            "audio_file": base64.b64encode(b"fake audio").decode("ascii"),
+            **values,
+        }
+        with (
+            mock.patch.object(
+                server,
+                "_ensure_transcriber_ready_or_raise",
+                return_value="qwen3-asr-mlx",
+            ),
+            mock.patch.object(
+                server,
+                "_run_transcription_pipeline",
+                side_effect=fake_pipeline,
+            ),
+        ):
+            response = self.client.post("/v1/audio/transcriptions", json=payload)
+        return response, captured
+
+    def test_json_transport_rejects_hidden_timestamps_in_plain_json_response(self) -> None:
+        with mock.patch.object(server, "_parse_audio_file_payload") as audio_parser:
+            response, captured = self._post_transcription({"word_timestamps": True})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("response_format=verbose_json", response.json()["detail"])
+        self.assertEqual(captured, {})
+        audio_parser.assert_not_called()
+
+    def test_json_transport_verbose_json_exposes_timestamp_provenance(self) -> None:
+        response, captured = self._post_transcription(
+            {
+                "response_format": "verbose_json",
+                "word_timestamps": True,
+                "timestamp_granularities": ["word"],
+            }
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["alignment_mode"], "on")
+        self.assertEqual(captured["response_format"], "verbose_json")
+        self.assertEqual(
+            response.json()["timestamp_provenance"],
+            {
+                "segments": "forced_alignment",
+                "words": "forced_alignment",
+                "alignment": "applied",
+            },
+        )
+
+    def test_chat_timestamp_controls_fail_before_audio_inference(self) -> None:
+        with (
+            mock.patch.object(
+                server,
+                "_ensure_transcriber_ready_or_raise",
+                return_value="qwen3-asr-mlx",
+            ),
+            mock.patch.object(server, "_run_transcription_pipeline") as pipeline,
+        ):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3-asr-mlx",
+                    "audio_file": base64.b64encode(b"fake audio").decode("ascii"),
+                    "word_timestamps": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "Chat Completions returns transcript text only",
+            response.json()["detail"],
+        )
+        pipeline.assert_not_called()
 
 
 class AlignmentDecisionTests(unittest.TestCase):
@@ -143,6 +264,44 @@ class AlignmentDecisionTests(unittest.TestCase):
         )
 
         self.assertFalse(enabled)
+
+
+class TimestampResponseContractTests(unittest.TestCase):
+    def test_verbose_json_accepts_word_timestamp_request(self) -> None:
+        server._validate_timestamp_response_contract(
+            response_format="verbose_json",
+            alignment_mode="on",
+            timestamp_granularities=["word"],
+        )
+
+    def test_plain_json_rejects_explicit_alignment(self) -> None:
+        with self.assertRaisesRegex(
+            server.HTTPException,
+            "response_format=verbose_json",
+        ):
+            server._validate_timestamp_response_contract(
+                response_format="json",
+                alignment_mode="on",
+                timestamp_granularities=[],
+            )
+
+    def test_chat_rejects_timestamp_output_controls(self) -> None:
+        with self.assertRaisesRegex(
+            server.HTTPException,
+            "Chat Completions returns transcript text only",
+        ):
+            server._validate_timestamp_response_contract(
+                response_format="json",
+                alignment_mode="auto",
+                timestamp_granularities=["segment"],
+                chat_response=True,
+            )
+
+    def test_plural_timestamp_granularities_normalize_to_contract_values(self) -> None:
+        self.assertEqual(
+            server._normalize_timestamp_granularities(["words", "segments", "word"]),
+            ["word", "segment"],
+        )
 
 
 class AlignmentChunkBoundaryTests(unittest.TestCase):
