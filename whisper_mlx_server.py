@@ -3650,7 +3650,7 @@ class AdmissionMetricsMiddleware:
 
 transcriber = MLXTranscriber(model_path=MODEL_PATH)
 aligner = MLXAligner(model_path=ALIGNER_PATH)
-app = FastAPI(title="Qwen3-ASR-MLX-Server", version="1.2.0")
+app = FastAPI(title="Qwen3-ASR-MLX-Server", version="1.1.1")
 
 app.add_middleware(AdmissionMetricsMiddleware, metrics=runtime_metrics)
 app.add_middleware(
