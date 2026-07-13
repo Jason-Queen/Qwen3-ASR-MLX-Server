@@ -2,8 +2,20 @@
 set -euo pipefail
 
 HOST="${QWEN_MLX_HOST:-127.0.0.1}"
-PORT="${1:-8989}"
+PORT="${1:-${QWEN_MLX_PORT:-8989}}"
 MODEL="${QWEN_MLX_MODEL_ID:-qwen3-asr-mlx}"
+ROLE="${QWEN_MLX_SMOKE_ROLE:-}"
+if [[ -z "${ROLE}" ]]; then
+  case "${PORT}" in
+    8989) ROLE="release" ;;
+    8990) ROLE="debug" ;;
+    *) ROLE="local" ;;
+  esac
+fi
+if [[ ! "${ROLE}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "QWEN_MLX_SMOKE_ROLE must contain only letters, digits, dot, underscore, or hyphen." >&2
+  exit 2
+fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WORKSPACE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
@@ -26,7 +38,7 @@ fi
 
 BASE_URL="http://${HOST}:${PORT}"
 TIMESTAMP="$(date '+%Y%m%d-%H%M%S')"
-OUT_DIR="${ARTIFACT_ROOT}/${TIMESTAMP}-release-${PORT}"
+OUT_DIR="${ARTIFACT_ROOT}/${TIMESTAMP}-${ROLE}-${PORT}"
 mkdir -p "$OUT_DIR"
 
 echo "Checking healthz..."
