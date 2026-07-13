@@ -1,6 +1,6 @@
 # AGENTS.md
 
-<!-- assembly-provenance: {"canon_revision":"sha256:0f62c4be8b4090488f4aa63f9aca1c0285142b8bdd7b0225d794877fef7e6877","contract_revision":"sha256:e97600d6e2a3f9e7585f765e45a771a3a83fc30b2a95699253c6d4f4a0694054","harness_revision":"sha256:10f15264ac63d74ad2a04f80cdcb66cbc9de275d4a21dfde6b9d22e0cee8dc7c","repo_facts_revision":"sha256:470f4f3eec0134d96b08b4165166e151dd7e0f60a2efb60ab66159e2769598c3","schema":1,"target":"agents-cross-agent"} -->
+<!-- assembly-provenance: {"canon_revision":"sha256:0f62c4be8b4090488f4aa63f9aca1c0285142b8bdd7b0225d794877fef7e6877","contract_revision":"sha256:88d17a8a34b26d06a44ed4cc0aa662040f893828be208031be38527cf33e0ff7","harness_revision":"sha256:10f15264ac63d74ad2a04f80cdcb66cbc9de275d4a21dfde6b9d22e0cee8dc7c","repo_facts_revision":"sha256:377ed2fd503aa66d7e2808006e3011f94827c27a6c75b64a1e38e0599fc75374","schema":1,"target":"agents-cross-agent"} -->
 
 ## Surface And Scope
 
@@ -12,7 +12,7 @@
 ## Repo Map
 
 - Top-level directories discovered during inspection: `scripts`, `tests`, and generated `qwen3_asr_mlx_server.egg-info`; the generated metadata is not source of truth.
-- Key manifests discovered at the repo root: `pyproject.toml`, `uv.lock`, and `requirements.txt`.
+- Key manifests discovered at the repo root: `Makefile`, `pyproject.toml`, `uv.lock`, and `requirements.txt`.
 - Existing instruction files to reconcile: `AGENTS.md`.
 - `whisper_mlx_server.py` implements the API and inference pipeline. `qwen3_asr_mlx_server.py` is the CLI and startup entry point.
 - `tests/` covers endpoint behavior, language handling, model resolution, and inference serialization. `scripts/smoke_local_api.sh` exercises the live HTTP contract.
@@ -29,10 +29,9 @@
 
 ## Commands And Verification
 
-- Explicit repo commands: none detected at the repo root.
-- Provisional inferred commands: `pytest` [to be confirmed].
-- Confirmed repo-standard test command: `uv run python -m unittest discover -s tests`.
-- Other verified repository commands:
+- Explicit repo commands: `make sync`, `make test`, `make run`, `make smoke`.
+- Confirmed repo-standard test command: `make test`.
+- The Make targets delegate to these direct commands:
   - Install: `uv sync --python 3.11`
   - Unit tests: `uv run python -m unittest discover -s tests`
   - Start: `uv run python qwen3_asr_mlx_server.py`
@@ -49,8 +48,3 @@
 | Change dependencies, versions, or release metadata | `pyproject.toml`, `uv.lock`, README, and the FastAPI version must describe one release state. | Inspect all four surfaces, run `uv sync --locked`, and rerun tests before integration. |
 | Download models or widen network exposure | Setup is explicit; runtime defaults to `127.0.0.1` and Qwen3 ASR model aliases. | Confirm the requested model/source and resolved path. Never treat `0.0.0.0` as a production-safe default. |
 | Integrate or publish code | Work on a branch rooted in `main`; keep local `debug/*` branches unpublished unless an owner explicitly changes that policy. | Confirm a common merge base, review `main...<branch>`, integrate normally, rerun release checks, and push only the intended release branch or tag. |
-
-## Open Items
-
-- Repository-level CI lint and type-check gates are [to be confirmed]; no CI workflow or dedicated lint/type-check configuration was present in the inspected tree.
-- Confirmation path: if automation is added, record its exact command here and keep the confirmed unittest and smoke gates unchanged unless the new workflow deliberately replaces them.
