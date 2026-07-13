@@ -1,6 +1,6 @@
 PYTHON_VERSION ?= 3.11
 PORT ?= 8989
-ROLE ?= local
+ROLE ?=
 
 .PHONY: sync test run smoke
 
