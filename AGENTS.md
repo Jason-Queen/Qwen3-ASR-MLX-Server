@@ -1,50 +1,61 @@
 # AGENTS.md
 
-<!-- assembly-provenance: {"canon_revision":"sha256:0f62c4be8b4090488f4aa63f9aca1c0285142b8bdd7b0225d794877fef7e6877","contract_revision":"sha256:88d17a8a34b26d06a44ed4cc0aa662040f893828be208031be38527cf33e0ff7","harness_revision":"sha256:10f15264ac63d74ad2a04f80cdcb66cbc9de275d4a21dfde6b9d22e0cee8dc7c","repo_facts_revision":"sha256:377ed2fd503aa66d7e2808006e3011f94827c27a6c75b64a1e38e0599fc75374","schema":1,"target":"agents-cross-agent"} -->
-
 ## Surface And Scope
 
-- Primary runtime surface: Cross-agent baseline.
-- Supported use cases: repository-wide implementation, testing, packaging, branch integration, and release verification for the Qwen3 ASR MLX server.
-- Out-of-scope use cases: machine-specific launchd ownership, local model inventory, temporary task briefs, and unlabeled runtime-specific controls.
-- Keep machine paths and workspace service operations in the parent workspace documentation. Keep this file portable and version it with the code.
+This repository is a macOS-focused local transcription server built on Qwen3-ASR and MLX. Start a fresh clone with the primary setup path below. `README.md` and `README.en.md` contain the detailed Chinese and English user guides.
+
+Default to `uv`, Python 3.11, and `127.0.0.1:8989`. Treat the repository as standalone: do not assume the maintainer's worktrees, service manager, reverse proxy, or model paths exist.
 
 ## Repo Map
 
-- Top-level directories discovered during inspection: `scripts`, `tests`, and generated `qwen3_asr_mlx_server.egg-info`; the generated metadata is not source of truth.
-- Key manifests discovered at the repo root: `Makefile`, `pyproject.toml`, `uv.lock`, and `requirements.txt`.
-- Existing instruction files to reconcile: `AGENTS.md`.
-- `whisper_mlx_server.py` implements the API and inference pipeline. `qwen3_asr_mlx_server.py` is the CLI and startup entry point.
-- `tests/` covers endpoint behavior, language handling, model resolution, and inference serialization. `scripts/smoke_local_api.sh` exercises the live HTTP contract.
+- `README.md` and `README.en.md` are the user-facing setup and API guides.
+- `qwen3_asr_mlx_server.py` is the CLI and package entry point.
+- `whisper_mlx_server.py` implements setup, model resolution, inference, and the HTTP API.
+- `pyproject.toml`, `uv.lock`, and `Makefile` define the environment and common commands.
+- `tests/` covers the API and inference boundaries. `scripts/smoke_local_api.sh` exercises a running server with real audio.
 
 ## Workflow And Handoffs
 
-- Repair versus new-file context: repair this existing shared repository contract in place; do not create branch-specific copies.
-- Nested context or monorepo signals: none detected. The parent local workspace may add machine-specific instructions without changing this portable contract.
-- Create development branches from `main`. In the local two-worktree layout, `debug/local` is the stable integration branch; routine promotion uses a normal merge, preferably `--ff-only`. Use cherry-pick only for an intentional backport.
-- Keep each commit isolated and complete. Add or update tests when behavior changes, and keep the README, package version, lockfile, API version, and smoke behavior consistent.
-- Handoff checkpoints: record the branch and commit, modified files, verification status, live-service state when relevant, and remaining work.
-- Intent-bearing handoff: record purpose, rationale, material tradeoffs, risks, deviations, and validation evidence; a file-by-file summary is only a navigation aid.
-- Intermediate work needs an owner and reconciliation path. The integrator reviews the final diff and reruns the release gates before calling the change complete.
+Before downloading weights, confirm the source, model variant, destination, and available disk space. Reuse an existing ASR model through `QWEN_MLX_MODEL_PATH`. Word timestamps need the optional aligner; set `QWEN_MLX_ALIGNER_PATH` when it is outside the auto-detected locations. Interactive setup can skip the aligner, while `--non-interactive` downloads every missing configured model, including the aligner.
+
+For MP3, MP4, M4A, or non-PCM WAV input, check that `ffmpeg` is on `PATH`. Keep the first server start in the foreground. Deployment is complete only after `/healthz` is ready, `/v1/models` responds, and one real audio file transcribes successfully.
+
+On failure, record the command, relevant `QWEN_MLX_*` values, HTTP status and body, resolved model path, and server error before proposing a cause. Use the model and queue components in `/healthz` to separate readiness from capacity failures.
+
+For code changes, update tests, exercise the affected live endpoint, and review the diff. Record the purpose, material risk or tradeoff, deviations, and validation evidence in the handoff.
 
 ## Commands And Verification
 
-- Explicit repo commands: `make sync`, `make test`, `make run`, `make smoke`.
-- Confirmed repo-standard test command: `make test`.
-- The Make targets delegate to these direct commands:
-  - Install: `uv sync --python 3.11`
-  - Unit tests: `uv run python -m unittest discover -s tests`
-  - Start: `uv run python qwen3_asr_mlx_server.py`
-  - Smoke: `./scripts/smoke_local_api.sh 8989`
-- Verification gates: run the unit suite and exercise every affected endpoint with the smoke script before integration. A documentation-only change still requires syntax and link/path review.
-- Preserve these live contracts: `/healthz`, `/v1/models`, multipart and JSON transcription, Chat Completions audio input, supported response formats, and `task=transcribe` rejection boundaries.
-- For changes that can affect MLX execution, verify serial inference locking, temporary-file cleanup, model fallback behavior, and timestamp/language metadata.
+Run the primary setup from the repository root:
+
+```bash
+uv sync --python 3.11
+uv run --python 3.11 qwen3_asr_mlx_server.py setup
+uv run --python 3.11 qwen3-asr-mlx-server
+```
+
+Interactive setup supports Hugging Face and ModelScope. For unattended setup, append `--non-interactive --source huggingface` or `--source modelscope`. In an activated Conda environment or `venv`, use `python qwen3_asr_mlx_server.py setup` and then `python qwen3_asr_mlx_server.py`.
+
+Check the running service:
+
+```bash
+curl -sS -i http://127.0.0.1:8989/healthz
+curl -fsS http://127.0.0.1:8989/v1/models
+curl -fsS http://127.0.0.1:8989/v1/audio/transcriptions \
+  -F "file=@/path/to/test.wav" \
+  -F "model=qwen3-asr-mlx" \
+  -F "response_format=json"
+```
+
+Ready means `/healthz` returns HTTP 200 with `live: true`, `ready: true`, and a ready required model. HTTP 503 means the model is unavailable or admission capacity is full; use the response body to distinguish them.
+
+Run `make test` for every code change. After starting the affected checkout, run `make smoke`; set `PORT=<port>` when the server does not use 8989.
 
 ## Constraints And Boundaries
 
-| State-changing operation | Enforcement surface | Confirmation and verification path |
-| --- | --- | --- |
-| Change API or inference behavior | Implementation, tests, and smoke script in the same branch. | Review the diff, run the unit suite, then smoke the affected endpoints against that checkout. |
-| Change dependencies, versions, or release metadata | `pyproject.toml`, `uv.lock`, README, and the FastAPI version must describe one release state. | Inspect all four surfaces, run `uv sync --locked`, and rerun tests before integration. |
-| Download models or widen network exposure | Setup is explicit; runtime defaults to `127.0.0.1` and Qwen3 ASR model aliases. | Confirm the requested model/source and resolved path. Never treat `0.0.0.0` as a production-safe default. |
-| Integrate or publish code | Work on a branch rooted in `main`; keep local `debug/*` branches unpublished unless an owner explicitly changes that policy. | Confirm a common merge base, review `main...<branch>`, integrate normally, rerun release checks, and push only the intended release branch or tag. |
+- Serving never downloads models. A request's `model` value is validated as a supported alias; `QWEN_MLX_MODEL_PATH` selects the files that are loaded.
+- The default bind is `127.0.0.1:8989`, and the server has no authentication. Bind to `0.0.0.0` only when the user requests LAN access, and never expose the service directly to the Internet.
+- Only `task=transcribe` is supported. `translate` is rejected.
+- Use `verbose_json`, `srt`, or `vtt` for timestamp-bearing output. Plain `json`, `text`, and Chat Completions reject timestamp controls.
+- Inference is serialized per process. Excess in-flight work returns HTTP 429 with `Retry-After: 1`; validate MLX memory use and concurrency before adding workers or parallel processes.
+- When public behavior or dependencies change, keep `README.md`, `README.en.md`, tests, package/API versions, `pyproject.toml`, `uv.lock`, and smoke behavior in sync.
