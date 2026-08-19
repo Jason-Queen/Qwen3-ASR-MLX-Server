@@ -20,6 +20,7 @@
   - `GET /healthz`
   - `GET /v1/models`
 - 支持 multipart 音频和 JSON `audio_file`（base64/buffer/list 变体）
+- 支持直接读取本地文件的 CLI，不受 HTTP 上传大小限制
 - 可选 forced alignment（词级时间戳，基于 Qwen3-ForcedAligner）
 - 支持终端交互式 setup 流程
 
@@ -105,7 +106,40 @@ uv run --python 3.11 qwen3_asr_mlx_server.py setup --non-interactive --source hu
 - 你也可以单独再跑一次 setup，只下载缺失的 Aligner。
 - 可通过 `--source huggingface` 或 `--source modelscope` 指定下载源。
 
-### 4）启动服务
+### 4）直接转录本地文件
+
+本地 CLI 直接把文件路径交给转录管线，不经过 HTTP 上传，因此不受
+`QWEN_MLX_MAX_UPLOAD_MB` 限制：
+
+```bash
+uv run --python 3.11 qwen3-asr-mlx-server transcribe /path/to/large.wav \
+  --response-format json \
+  --output /path/to/result.json
+```
+
+需要词级时间戳时：
+
+```bash
+uv run --python 3.11 qwen3-asr-mlx-server transcribe /path/to/large.wav \
+  --response-format verbose_json \
+  --alignment on \
+  --word-timestamps \
+  --timestamp-granularity word \
+  --output /path/to/result.json
+```
+
+CLI 支持与转录 API 相同的 `language`、`prompt`、输出格式和 decode 参数。未指定
+`--max-tokens` 时，会按音频时长以每 20 分钟 8192 tokens 自动扩展整次任务预算；显式值始终优先。
+长音频仍由 Qwen3-ASR 在模型内部寻找低能量边界分块，并由本项目完成 forced alignment
+与全局时间轴验证，不需要预先把源文件硬切成多个上传任务。
+
+默认结果写到 stdout；`--output/-o` 只在成功后原子替换目标文件。CLI 不会删除或覆盖
+源文件。路径不存在、不是普通文件、为空或输出指向源文件时退出码为 `2`；模型、ffmpeg
+或 alignment 失败时为 `1`；用户中断时为 `130`。
+
+CLI 会在独立进程中加载模型。避免让它与服务中的其它 MLX 推理任务并行运行。
+
+### 5）启动服务
 
 ```bash
 uv run --python 3.11 qwen3-asr-mlx-server
@@ -146,7 +180,7 @@ python qwen3_asr_mlx_server.py
 - 默认服务不会在启动或请求过程中自动下载模型；若自动识别不到缓存目录或本地目录，请显式设置
   `QWEN_MLX_MODEL_PATH` / `QWEN_MLX_ALIGNER_PATH`，或手动运行 `python qwen3_asr_mlx_server.py setup`。
 
-### 5）快速测试
+### 6）快速测试
 
 ```bash
 curl -X POST 'http://127.0.0.1:8989/v1/audio/transcriptions' \
@@ -155,7 +189,7 @@ curl -X POST 'http://127.0.0.1:8989/v1/audio/transcriptions' \
   -F "response_format=json"
 ```
 
-### 6）关键环境变量
+### 7）关键环境变量
 
 ```bash
 QWEN_MLX_MODEL_PATH=./Qwen3-ASR-1.7B-bf16

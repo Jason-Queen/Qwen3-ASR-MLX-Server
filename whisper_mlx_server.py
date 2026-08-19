@@ -50,6 +50,10 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_HF_ASR_REPO_ID = "mlx-community/Qwen3-ASR-1.7B-bf16"
 DEFAULT_HF_ALIGNER_REPO_ID = "mlx-community/Qwen3-ForcedAligner-0.6B-bf16"
 SETUP_COMMAND_HINT = "python qwen3_asr_mlx_server.py setup"
+APP_VERSION = "1.2.0"
+DEFAULT_MAX_TOKENS = 8192
+AUTO_TOKEN_BUDGET_WINDOW_SECONDS = 1200.0
+PROCESSED_DURATION_TOLERANCE_SECONDS = 0.05
 
 
 def _workspace_root(base_dir: Path | None = None) -> Path | None:
@@ -355,6 +359,8 @@ class TranscriptionResult:
     segment_timestamp_source: str = "asr"
     word_timestamp_source: str | None = None
     alignment_status: str = "not_requested"
+    processed_duration: float | None = None
+    generation_tokens: int | None = None
 
 
 @dataclass
@@ -1263,13 +1269,19 @@ def _normalize_result(
 ) -> TranscriptionResult:
     text: str | None = None
     raw_language: Any = None
+    raw_segments: Any = None
+    raw_generation_tokens: Any = None
     segments: list[dict[str, Any]] = []
     segment_timestamp_source = "none"
 
     if isinstance(raw_result, dict):
         text = _coalesce_text(raw_result)
         raw_language = raw_result.get("language")
-        segments = _normalize_segments(raw_result.get("segments") or raw_result.get("chunks"))
+        raw_segments = raw_result.get("segments")
+        if raw_segments is None:
+            raw_segments = raw_result.get("chunks")
+        raw_generation_tokens = raw_result.get("generation_tokens")
+        segments = _normalize_segments(raw_segments)
         if segments:
             segment_timestamp_source = "asr"
 
@@ -1284,9 +1296,11 @@ def _normalize_result(
     else:
         text = _coalesce_text(raw_result)
         raw_language = getattr(raw_result, "language", None)
-        segments = _normalize_segments(
-            getattr(raw_result, "segments", None) or getattr(raw_result, "chunks", None)
-        )
+        raw_segments = getattr(raw_result, "segments", None)
+        if raw_segments is None:
+            raw_segments = getattr(raw_result, "chunks", None)
+        raw_generation_tokens = getattr(raw_result, "generation_tokens", None)
+        segments = _normalize_segments(raw_segments)
         if segments:
             segment_timestamp_source = "asr"
 
@@ -1308,6 +1322,9 @@ def _normalize_result(
         segment_timestamp_source = "estimated"
 
     duration = max((seg.get("end", 0.0) for seg in segments), default=0.0)
+    processed_duration = _raw_segments_duration(raw_segments)
+    if processed_duration is None and segment_timestamp_source == "asr":
+        processed_duration = duration
 
     language = (
         _resolve_primary_language_from_segments(segments)
@@ -1321,6 +1338,8 @@ def _normalize_result(
         segments=segments,
         duration=duration,
         segment_timestamp_source=segment_timestamp_source,
+        processed_duration=processed_duration,
+        generation_tokens=_optional_nonnegative_int(raw_generation_tokens),
     )
 
 
@@ -1422,6 +1441,37 @@ def _select_primary_language_code(codes: list[str]) -> str | None:
         first_index.setdefault(code, index)
 
     return max(codes, key=lambda code: (counts[code], -first_index[code]))
+
+
+def _raw_segments_duration(raw_segments: Any) -> float | None:
+    if not isinstance(raw_segments, (list, tuple)):
+        return None
+    if not raw_segments:
+        return 0.0
+
+    ends: list[float] = []
+    for item in raw_segments:
+        if isinstance(item, dict):
+            start = _to_float(item.get("start"), 0.0)
+            end = _to_float(item.get("end"), start)
+            timestamp = item.get("timestamp")
+            if isinstance(timestamp, (list, tuple)) and len(timestamp) >= 2:
+                end = _to_float(timestamp[1], end)
+        else:
+            start = _to_float(getattr(item, "start", None), 0.0)
+            end = _to_float(getattr(item, "end", None), start)
+        ends.append(max(start, end))
+
+    return max(ends) if ends else None
+
+
+def _optional_nonnegative_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _normalize_segments(raw_segments: Any) -> list[dict[str, Any]]:
@@ -1931,6 +1981,55 @@ def _get_wav_duration_seconds(path: str) -> float | None:
             return frame_count / float(frame_rate)
     except Exception:
         return None
+
+
+def _decode_options_with_auto_token_budget(
+    decode_options: dict[str, Any] | None,
+    duration_sec: float | None,
+) -> dict[str, Any]:
+    options = dict(decode_options or {})
+    if "max_tokens" in options or not duration_sec or duration_sec <= 0.0:
+        return options
+
+    windows = max(1, int(math.ceil(duration_sec / AUTO_TOKEN_BUDGET_WINDOW_SECONDS)))
+    options["max_tokens"] = DEFAULT_MAX_TOKENS * windows
+    return options
+
+
+def _validate_processed_audio_coverage(
+    result: TranscriptionResult,
+    duration_sec: float | None,
+    *,
+    stage: str,
+    max_tokens: int | None = None,
+) -> None:
+    if (
+        max_tokens is not None
+        and result.generation_tokens is not None
+        and result.generation_tokens >= max_tokens
+    ):
+        raise RuntimeError(
+            f"{stage} exhausted max_tokens={max_tokens} before emitting an end token; "
+            "increase max_tokens or omit it to use the automatic long-audio budget"
+        )
+
+    if not duration_sec or duration_sec <= 0.0:
+        return
+
+    processed_duration = result.processed_duration
+    if processed_duration is None and result.segment_timestamp_source == "asr":
+        processed_duration = result.duration
+    if processed_duration is None:
+        return
+
+    if processed_duration + PROCESSED_DURATION_TOLERANCE_SECONDS < duration_sec:
+        raise RuntimeError(
+            f"{stage} did not cover the complete audio timeline: "
+            f"processed={processed_duration:.3f}s expected={duration_sec:.3f}s; "
+            "increase max_tokens or omit it to use the automatic long-audio budget"
+        )
+
+    result.duration = duration_sec
 
 
 def _should_rechunk_segments_for_alignment(
@@ -2859,65 +2958,74 @@ def _as_vtt(result: TranscriptionResult) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def _build_transcription_response(result: TranscriptionResult, response_format: str) -> Response:
+def _verbose_json_payload(result: TranscriptionResult) -> dict[str, Any]:
+    primary_language = result.language or "unknown"
+    detected_languages = _summarize_detected_languages(result)
+    payload: dict[str, Any] = {
+        "task": "transcribe",
+        "language": primary_language,
+        "primary_language": primary_language,
+        "duration": result.duration,
+        "text": result.text,
+        "timestamp_provenance": {
+            "segments": result.segment_timestamp_source,
+            "words": result.word_timestamp_source,
+            "alignment": result.alignment_status,
+        },
+        "segments": [
+            {
+                "id": segment["id"],
+                "seek": 0,
+                "start": segment["start"],
+                "end": segment["end"],
+                "text": segment["text"],
+                **(
+                    {"language": segment["language"]}
+                    if _to_language_code(str(segment.get("language", "")).strip())
+                    else {}
+                ),
+                "tokens": [],
+                "temperature": 0.0,
+                "avg_logprob": 0.0,
+                "compression_ratio": 0.0,
+                "no_speech_prob": 0.0,
+            }
+            for segment in result.segments
+        ],
+    }
+    if detected_languages:
+        payload["detected_languages"] = detected_languages
+    if result.words:
+        payload["words"] = [
+            {
+                "word": word["word"],
+                "start": word["start"],
+                "end": word["end"],
+            }
+            for word in result.words
+        ]
+    return payload
+
+
+def _transcription_output(result: TranscriptionResult, response_format: str) -> dict[str, Any] | str:
     if response_format == "text":
-        return PlainTextResponse(content=result.text)
-
+        return result.text
     if response_format == "verbose_json":
-        primary_language = result.language or "unknown"
-        detected_languages = _summarize_detected_languages(result)
-        payload: dict[str, Any] = {
-            "task": "transcribe",
-            "language": primary_language,
-            "primary_language": primary_language,
-            "duration": result.duration,
-            "text": result.text,
-            "timestamp_provenance": {
-                "segments": result.segment_timestamp_source,
-                "words": result.word_timestamp_source,
-                "alignment": result.alignment_status,
-            },
-            "segments": [
-                {
-                    "id": segment["id"],
-                    "seek": 0,
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "text": segment["text"],
-                    **(
-                        {"language": segment["language"]}
-                        if _to_language_code(str(segment.get("language", "")).strip())
-                        else {}
-                    ),
-                    "tokens": [],
-                    "temperature": 0.0,
-                    "avg_logprob": 0.0,
-                    "compression_ratio": 0.0,
-                    "no_speech_prob": 0.0,
-                }
-                for segment in result.segments
-            ],
-        }
-        if detected_languages:
-            payload["detected_languages"] = detected_languages
-        if result.words:
-            payload["words"] = [
-                {
-                    "word": word["word"],
-                    "start": word["start"],
-                    "end": word["end"],
-                }
-                for word in result.words
-            ]
-        return JSONResponse(content=payload)
-
+        return _verbose_json_payload(result)
     if response_format == "srt":
-        return PlainTextResponse(content=_as_srt(result), media_type="text/plain; charset=utf-8")
-
+        return _as_srt(result)
     if response_format == "vtt":
-        return PlainTextResponse(content=_as_vtt(result), media_type="text/vtt; charset=utf-8")
+        return _as_vtt(result)
+    return {"text": result.text}
 
-    return JSONResponse(content={"text": result.text})
+
+def _build_transcription_response(result: TranscriptionResult, response_format: str) -> Response:
+    output = _transcription_output(result, response_format)
+    if isinstance(output, dict):
+        return JSONResponse(content=output)
+    if response_format == "vtt":
+        return PlainTextResponse(content=output, media_type="text/vtt; charset=utf-8")
+    return PlainTextResponse(content=output, media_type="text/plain; charset=utf-8")
 
 
 def _normalize_task(task: Any) -> str | None:
@@ -3238,11 +3346,34 @@ def _detect_audio_container(audio_bytes: bytes) -> str | None:
     return None
 
 
+def _read_audio_header(path: str, size: int = 64) -> bytes:
+    try:
+        with open(path, "rb") as audio_file:
+            return audio_file.read(size)
+    except OSError:
+        return b""
+
+
 def _is_standard_pcm16_mono_16k_wav(audio_bytes: bytes) -> bool:
     if _detect_audio_container(audio_bytes) != "wav":
         return False
     try:
         with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+            return (
+                wav_file.getnchannels() == 1
+                and wav_file.getframerate() == 16000
+                and wav_file.getsampwidth() == 2
+                and wav_file.getcomptype() == "NONE"
+            )
+    except Exception:
+        return False
+
+
+def _is_standard_pcm16_mono_16k_wav_path(path: str) -> bool:
+    if _detect_audio_container(_read_audio_header(path)) != "wav":
+        return False
+    try:
+        with wave.open(path, "rb") as wav_file:
             return (
                 wav_file.getnchannels() == 1
                 and wav_file.getframerate() == 16000
@@ -3378,7 +3509,10 @@ def _parse_audio_file_payload(audio_spec: Any, payload: dict[str, Any]) -> tuple
     raise HTTPException(status_code=400, detail="Invalid audio_file format in JSON body")
 
 
-def _transcode_with_ffmpeg(input_path: str) -> tuple[str | None, str | None]:
+def _transcode_with_ffmpeg(
+    input_path: str,
+    timeout_seconds: float | None = 20.0,
+) -> tuple[str | None, str | None]:
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as converted:
         converted_path = converted.name
 
@@ -3399,10 +3533,18 @@ def _transcode_with_ffmpeg(input_path: str) -> tuple[str | None, str | None]:
         converted_path,
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
     except subprocess.TimeoutExpired:
         Path(converted_path).unlink(missing_ok=True)
-        return None, "ffmpeg transcode timed out after 20 seconds"
+        return None, f"ffmpeg transcode timed out after {timeout_seconds:g} seconds"
+    except OSError as exc:
+        Path(converted_path).unlink(missing_ok=True)
+        return None, f"ffmpeg could not start: {exc}"
 
     if proc.returncode == 0 and Path(converted_path).exists() and Path(converted_path).stat().st_size > 44:
         return converted_path, None
@@ -3458,10 +3600,10 @@ async def _run_blocking_safely(
         _CURRENT_REQUEST_ID.reset(request_token)
 
 
-async def _run_transcription_pipeline(
+async def _run_transcription_path_pipeline(
     *,
     request_id: str,
-    audio_bytes: bytes,
+    audio_path: str,
     file_name: str,
     language: str | None,
     prompt: str | None,
@@ -3469,38 +3611,38 @@ async def _run_transcription_pipeline(
     response_format: str,
     timestamp_granularities: list[str] | None,
     decode_options: dict[str, Any] | None = None,
+    ffmpeg_timeout_seconds: float | None = None,
 ) -> TranscriptionResult:
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file/audio_file is empty")
-
-    if len(audio_bytes) > MAX_UPLOAD_BYTES:
+    source_path = Path(audio_path)
+    try:
+        input_size_bytes = source_path.stat().st_size
+    except OSError as exc:
         raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Max allowed size is {MAX_UPLOAD_MB} MB",
-        )
+            status_code=400,
+            detail=f"Audio file is unavailable: {source_path}",
+        ) from exc
+    if not source_path.is_file():
+        raise HTTPException(status_code=400, detail=f"Audio path is not a file: {source_path}")
+    if input_size_bytes <= 0:
+        raise HTTPException(status_code=400, detail=f"Audio file is empty: {source_path}")
 
     decode_options = dict(decode_options or {})
-    detected_container = _detect_audio_container(audio_bytes)
+    detected_container = _detect_audio_container(_read_audio_header(audio_path))
     logger.info(
-        "[%s] Audio decoded bytes=%d file_name=%s container=%s language=%s",
+        "[%s] Audio input bytes=%d file_name=%s container=%s language=%s",
         request_id,
-        len(audio_bytes),
+        input_size_bytes,
         file_name,
         detected_container or "unknown",
         language or "auto",
     )
     timestamps_requested = _timestamp_requests_alignment(timestamp_granularities)
 
-    suffix = Path(file_name).suffix or ".wav"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as audio_file:
-        audio_path = audio_file.name
-        audio_file.write(audio_bytes)
-
     converted_audio_path: str | None = None
     ffmpeg_error: str | None = None
     ffmpeg_status = "not_run"
     try:
-        if _is_standard_pcm16_mono_16k_wav(audio_bytes):
+        if _is_standard_pcm16_mono_16k_wav_path(audio_path):
             infer_audio_path = audio_path
             ffmpeg_error = "none"
             ffmpeg_status = "skipped"
@@ -3509,9 +3651,12 @@ async def _run_transcription_pipeline(
                 request_id,
                 _transcode_with_ffmpeg,
                 audio_path,
+                ffmpeg_timeout_seconds,
             )
-            infer_audio_path = converted_audio_path or audio_path
             ffmpeg_status = "ok" if converted_audio_path else "failed"
+            if converted_audio_path is None:
+                raise RuntimeError(f"ffmpeg transcode failed: {ffmpeg_error or 'unknown error'}")
+            infer_audio_path = converted_audio_path
 
         logger.info(
             "[%s] ffmpeg_transcode=%s ffmpeg_error=%s infer_audio_path=%s",
@@ -3521,16 +3666,35 @@ async def _run_transcription_pipeline(
             infer_audio_path,
         )
 
+        wav_duration_sec = _get_wav_duration_seconds(infer_audio_path)
+        effective_decode_options = _decode_options_with_auto_token_budget(
+            decode_options,
+            wav_duration_sec,
+        )
+        if "max_tokens" not in decode_options and "max_tokens" in effective_decode_options:
+            logger.info(
+                "[%s] auto_max_tokens=%d duration=%.3fs window=%.0fs",
+                request_id,
+                effective_decode_options["max_tokens"],
+                float(wav_duration_sec or 0.0),
+                AUTO_TOKEN_BUDGET_WINDOW_SECONDS,
+            )
+
         result = await _run_blocking_safely(
             request_id,
             transcriber.transcribe,
             infer_audio_path,
             language,
             prompt,
-            decode_options,
+            effective_decode_options,
         )
 
-        wav_duration_sec = _get_wav_duration_seconds(infer_audio_path)
+        _validate_processed_audio_coverage(
+            result,
+            wav_duration_sec,
+            stage="ASR transcription",
+            max_tokens=effective_decode_options.get("max_tokens"),
+        )
         audio_duration_sec = wav_duration_sec or result.duration
         detected_language_code = _finalize_result_language(language, result)
         auto_align_lang_codes = _effective_auto_align_lang_codes(aligner)
@@ -3591,7 +3755,7 @@ async def _run_transcription_pipeline(
                         request_id,
                         ALIGNMENT_CHUNK_SECONDS,
                     )
-                    rechunk_options = dict(decode_options)
+                    rechunk_options = dict(effective_decode_options)
                     rechunk_options["chunk_duration"] = ALIGNMENT_CHUNK_SECONDS
                     result = await _run_blocking_safely(
                         request_id,
@@ -3600,6 +3764,12 @@ async def _run_transcription_pipeline(
                         language,
                         prompt,
                         rechunk_options,
+                    )
+                    _validate_processed_audio_coverage(
+                        result,
+                        wav_duration_sec,
+                        stage="alignment ASR rechunk",
+                        max_tokens=rechunk_options.get("max_tokens"),
                     )
                     detected_language_code = _finalize_result_language(language, result)
 
@@ -3695,7 +3865,7 @@ async def _run_transcription_pipeline(
                 detail=(
                     "Invalid or unsupported audio payload. "
                     f"Please ensure Spokenly sends valid audio bytes/base64. "
-                    f"decoded_size={len(audio_bytes)} bytes, "
+                    f"decoded_size={input_size_bytes} bytes, "
                     f"detected_container={detected_container or 'unknown'}, "
                     f"file_name={file_name}, "
                     f"ffmpeg_transcode={ffmpeg_status}, "
@@ -3730,15 +3900,67 @@ async def _run_transcription_pipeline(
             ),
         ) from exc
     finally:
-        try:
-            Path(audio_path).unlink(missing_ok=True)
-        except OSError:
-            pass
         if converted_audio_path:
             try:
                 Path(converted_audio_path).unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+async def _run_transcription_pipeline(
+    *,
+    request_id: str,
+    audio_bytes: bytes,
+    file_name: str,
+    language: str | None,
+    prompt: str | None,
+    alignment_mode: str,
+    response_format: str,
+    timestamp_granularities: list[str] | None,
+    decode_options: dict[str, Any] | None = None,
+) -> TranscriptionResult:
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file/audio_file is empty")
+
+    if len(audio_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Max allowed size is {MAX_UPLOAD_MB} MB",
+        )
+
+    detected_container = _detect_audio_container(audio_bytes)
+    logger.info(
+        "[%s] Audio decoded bytes=%d file_name=%s container=%s language=%s",
+        request_id,
+        len(audio_bytes),
+        file_name,
+        detected_container or "unknown",
+        language or "auto",
+    )
+
+    suffix = Path(file_name).suffix or ".wav"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as audio_file:
+        audio_path = audio_file.name
+        audio_file.write(audio_bytes)
+
+    try:
+        return await _run_transcription_path_pipeline(
+            request_id=request_id,
+            audio_path=audio_path,
+            file_name=file_name,
+            language=language,
+            prompt=prompt,
+            alignment_mode=alignment_mode,
+            response_format=response_format,
+            timestamp_granularities=timestamp_granularities,
+            decode_options=decode_options,
+            ffmpeg_timeout_seconds=20.0,
+        )
+    finally:
+        try:
+            Path(audio_path).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 _ADMISSION_PATHS = {
@@ -3818,7 +4040,7 @@ class AdmissionMetricsMiddleware:
 
 transcriber = MLXTranscriber(model_path=MODEL_PATH)
 aligner = MLXAligner(model_path=ALIGNER_PATH)
-app = FastAPI(title="Qwen3-ASR-MLX-Server", version="1.1.2")
+app = FastAPI(title="Qwen3-ASR-MLX-Server", version=APP_VERSION)
 
 app.add_middleware(AdmissionMetricsMiddleware, metrics=runtime_metrics)
 app.add_middleware(
@@ -4190,51 +4412,207 @@ async def chat_completions(request: Request) -> Response:
     )
 
 
-def main() -> None:
-    import uvicorn
+def _add_cli_decode_arguments(parser: argparse.ArgumentParser) -> None:
+    for option_name, option_type in DECODE_OPTION_TYPES.items():
+        parser.add_argument(
+            f"--{option_name.replace('_', '-')}",
+            dest=option_name,
+            type=int if option_type == "int" else float,
+        )
 
-    global LOG_PROMPTS
 
-    parser = argparse.ArgumentParser(description="Qwen3-ASR-MLX-Server")
-    parser.add_argument(
-        "command",
-        nargs="?",
-        default="serve",
-        choices=["serve", "setup"],
-        help="Run API server or interactive model setup",
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Qwen3-ASR MLX server and local-file CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    serve = subparsers.add_parser("serve", help="Run the HTTP API server")
+    serve.add_argument(
+        "--log-prompts",
+        action="store_true",
+        help="Log request prompt previews at INFO level (disabled by default)",
     )
-    parser.add_argument(
+
+    setup = subparsers.add_parser("setup", help="Run interactive model setup")
+    setup.add_argument(
         "--source",
         choices=["huggingface", "modelscope"],
         default=None,
-        help="Download source for setup command",
+        help="Download source",
     )
-    parser.add_argument(
+    setup.add_argument(
         "--non-interactive",
         action="store_true",
-        help="Setup mode: download all missing models with defaults",
+        help="Download all missing models with defaults",
     )
-    parser.add_argument(
-        "--log-prompts",
-        action="store_true",
-        help="Serve mode: log request prompt previews at INFO level (disabled by default)",
+
+    transcribe = subparsers.add_parser(
+        "transcribe",
+        help="Transcribe a local file without the HTTP upload-size limit",
     )
-    args = parser.parse_args()
+    transcribe.add_argument("audio", help="Local audio or video file")
+    transcribe.add_argument("--model", default=MODEL_ID)
+    transcribe.add_argument("--language")
+    transcribe.add_argument("--prompt")
+    transcribe.add_argument(
+        "--response-format",
+        choices=sorted(SUPPORTED_RESPONSE_FORMATS),
+        default="json",
+    )
+    transcribe.add_argument("--alignment", choices=["auto", "on", "off"])
+    transcribe.add_argument(
+        "--word-timestamps",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    transcribe.add_argument(
+        "--timestamp-granularity",
+        action="append",
+        choices=sorted(SUPPORTED_TIMESTAMP_GRANULARITIES),
+    )
+    transcribe.add_argument("-o", "--output")
+    _add_cli_decode_arguments(transcribe)
+    return parser
+
+
+def _normalized_cli_argv(argv: list[str]) -> list[str]:
+    if not argv:
+        return ["serve"]
+    if argv[0] in {"-h", "--help", "serve", "setup", "transcribe"}:
+        return argv
+    if argv[0].startswith("-"):
+        return ["serve", *argv]
+    return argv
+
+
+def _serialize_cli_output(result: TranscriptionResult, response_format: str) -> bytes:
+    output = _transcription_output(result, response_format)
+    if isinstance(output, dict):
+        return (json.dumps(output, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if not output.endswith("\n"):
+        output += "\n"
+    return output.encode("utf-8")
+
+
+def _emit_cli_output(content: bytes, output_path: str | None) -> None:
+    if output_path in {None, "-"}:
+        sys.stdout.buffer.write(content)
+        sys.stdout.buffer.flush()
+        return
+
+    target = Path(output_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=target.parent,
+            delete=False,
+        ) as output_file:
+            temp_path = output_file.name
+            output_file.write(content)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _run_local_transcribe_command(args: argparse.Namespace) -> int:
+    audio_path = Path(args.audio).expanduser().resolve()
+    try:
+        audio_size = audio_path.stat().st_size
+    except OSError:
+        print(f"Audio file does not exist or is unreadable: {audio_path}", file=sys.stderr)
+        return 2
+    if not audio_path.is_file():
+        print(f"Audio path is not a regular file: {audio_path}", file=sys.stderr)
+        return 2
+    if audio_size <= 0:
+        print(f"Audio file is empty: {audio_path}", file=sys.stderr)
+        return 2
+    if args.output not in {None, "-"}:
+        output_path = Path(args.output).expanduser().resolve()
+        if output_path == audio_path:
+            print("Output path must not overwrite the source audio file.", file=sys.stderr)
+            return 2
+
+    alignment_mode = _parse_alignment_mode(args.alignment)
+    if args.alignment is None and args.word_timestamps is not None:
+        alignment_mode = "on" if args.word_timestamps else "off"
+    timestamp_granularities = _normalize_timestamp_granularities(
+        args.timestamp_granularity
+    )
+
+    try:
+        _validate_timestamp_response_contract(
+            response_format=args.response_format,
+            alignment_mode=alignment_mode,
+            timestamp_granularities=timestamp_granularities,
+        )
+        _ensure_transcriber_ready_or_raise(args.model)
+        decode_options = _collect_decode_options(
+            **{name: getattr(args, name) for name in DECODE_OPTION_TYPES}
+        )
+        result = asyncio.run(
+            _run_transcription_path_pipeline(
+                request_id=f"cli-{uuid.uuid4().hex[:8]}",
+                audio_path=str(audio_path),
+                file_name=audio_path.name,
+                language=args.language,
+                prompt=args.prompt,
+                alignment_mode=alignment_mode,
+                response_format=args.response_format,
+                timestamp_granularities=timestamp_granularities,
+                decode_options=decode_options,
+            )
+        )
+        _emit_cli_output(
+            _serialize_cli_output(result, args.response_format),
+            args.output,
+        )
+    except KeyboardInterrupt:
+        print("Transcription interrupted.", file=sys.stderr)
+        return 130
+    except HTTPException as exc:
+        print(str(exc.detail), file=sys.stderr)
+        return 1
+    except Exception as exc:
+        logger.error("Local transcription failed: %s\n%s", exc, traceback.format_exc())
+        print(f"Local transcription failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    global LOG_PROMPTS
+
+    parser = _build_cli_parser()
+    args = parser.parse_args(_normalized_cli_argv(list(sys.argv[1:] if argv is None else argv)))
 
     if args.command == "setup":
-        raise SystemExit(run_setup_wizard(source=args.source, non_interactive=args.non_interactive))
+        return run_setup_wizard(source=args.source, non_interactive=args.non_interactive)
+    if args.command == "transcribe":
+        return _run_local_transcribe_command(args)
 
     if args.log_prompts:
         LOG_PROMPTS = True
-
     if LOG_PROMPTS:
         logger.warning(
             "Prompt logging is enabled; request prompt previews will be written to INFO logs"
         )
 
+    import uvicorn
+
     maybe_prompt_initial_setup()
     uvicorn.run(app, host=HOST, port=PORT)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

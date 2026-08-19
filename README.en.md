@@ -20,6 +20,7 @@ Ready for use with Spokenly, OpenWhispr, and other OpenAI-compatible transcripti
   - `GET /healthz`
   - `GET /v1/models`
 - Accepts multipart audio and JSON `audio_file` payloads (base64/buffer/list variants)
+- Direct local-file CLI without the HTTP upload size limit
 - Optional forced alignment (word timestamps) with Qwen3-ForcedAligner
 - Terminal-based interactive setup flow
 
@@ -105,7 +106,42 @@ Download the Aligner proactively (word timestamps):
 - You can run setup again later to download only the missing aligner.
 - Use `--source huggingface` or `--source modelscope` to select download source.
 
-### 4) Run Server
+### 4) Transcribe a Local File Directly
+
+The local CLI passes the file path directly to the transcription pipeline instead of uploading it
+over HTTP, so `QWEN_MLX_MAX_UPLOAD_MB` does not apply:
+
+```bash
+uv run --python 3.11 qwen3-asr-mlx-server transcribe /path/to/large.wav \
+  --response-format json \
+  --output /path/to/result.json
+```
+
+For word timestamps:
+
+```bash
+uv run --python 3.11 qwen3-asr-mlx-server transcribe /path/to/large.wav \
+  --response-format verbose_json \
+  --alignment on \
+  --word-timestamps \
+  --timestamp-granularity word \
+  --output /path/to/result.json
+```
+
+The CLI accepts the same language, prompt, output-format, and decode controls as the transcription
+API. If `--max-tokens` is omitted, the total task budget grows by 8192 tokens for every 20 minutes
+of audio; an explicit value always wins. Long audio still uses Qwen3-ASR's internal low-energy
+chunk boundaries plus this project's forced alignment and global timeline validation. Do not split
+the source into fixed-duration upload jobs first.
+
+Output goes to stdout by default; `--output/-o` atomically replaces its target only after success.
+The CLI never deletes or overwrites the source. A missing, non-regular, empty, or self-overwriting
+path exits `2`; model, ffmpeg, or alignment failures exit `1`; user interruption exits `130`.
+
+The CLI loads the models in a separate process. Avoid running it concurrently with other MLX
+inference work in the server process.
+
+### 5) Run Server
 
 ```bash
 uv run --python 3.11 qwen3-asr-mlx-server
@@ -144,7 +180,7 @@ Notes:
 - The request `model` field is used for compatibility and validation.
 - The actual loaded model is determined by `QWEN_MLX_MODEL_PATH`.
 
-### 5) Quick Test
+### 6) Quick Test
 
 ```bash
 curl -X POST 'http://127.0.0.1:8989/v1/audio/transcriptions' \
@@ -153,7 +189,7 @@ curl -X POST 'http://127.0.0.1:8989/v1/audio/transcriptions' \
   -F "response_format=json"
 ```
 
-### 6) Important Environment Variables
+### 7) Important Environment Variables
 
 ```bash
 QWEN_MLX_MODEL_PATH=./Qwen3-ASR-1.7B-bf16
