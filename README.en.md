@@ -189,6 +189,7 @@ Chunk size tuning guidance:
 - `/healthz` returns model, optional-aligner, and admission/queue readiness plus cumulative admission, inference-wait, decoded-audio memory, process peak-RSS, and cancellation metrics. It returns `503` when the required ASR model is not ready or admission is full; an unavailable optional aligner is reported without disabling text-only transcription.
 - Plain `json` and `text` are text-only contracts. Explicit `alignment=on`, `word_timestamps=true`, or `timestamp_granularities` with either format returns `400` instead of performing alignment and hiding the result. Use `verbose_json` for JSON timestamps, or `srt`/`vtt` for subtitles. Chat Completions remains text-only and rejects timestamp output controls.
 - Auto forced-alignment runs only for timestamp-capable outputs (`verbose_json`, `srt`, `vtt`).
+- Forced-alignment segment rebuilding validates every item with the aligner's own canonical tokenizer, so each aligned word is consumed exactly once instead of being distributed by estimated word counts. If aligned-word identity or chunk-text coverage cannot be verified, alignment fails (explicit requests return an error; auto mode preserves the ASR result). If only sentence-boundary mapping cannot be verified, validated word timestamps may still be returned while ASR segments and their provenance are preserved rather than labeling approximate boundaries as forced alignment.
 - Auto forced-alignment for `zh/en/ja/ko` is runtime-gated by aligner/dependencies:
   - `zh/en`: aligner model must be ready
   - `ja`: aligner + `nagisa`

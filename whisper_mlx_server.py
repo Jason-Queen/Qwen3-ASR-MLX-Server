@@ -21,6 +21,7 @@ import time
 import traceback
 import uuid
 import wave
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, Lock
@@ -228,8 +229,6 @@ SEGMENT_REBUILD_FROM_WORDS = (
 )
 SEGMENT_MERGE_TARGET_SECONDS = float(os.getenv("QWEN_MLX_SEGMENT_MERGE_TARGET_SECONDS", "0"))
 SEGMENT_HARD_MAX_SECONDS = float(os.getenv("QWEN_MLX_SEGMENT_HARD_MAX_SECONDS", "12"))
-SEGMENT_PAUSE_THRESHOLD_SECONDS = float(os.getenv("QWEN_MLX_SEGMENT_PAUSE_THRESHOLD_SECONDS", "0.75"))
-SEGMENT_MAX_WORDS_PER_SEGMENT = int(os.getenv("QWEN_MLX_SEGMENT_MAX_WORDS_PER_SEGMENT", "28"))
 HOST = os.getenv("QWEN_MLX_HOST", "127.0.0.1")
 PORT = int(os.getenv("QWEN_MLX_PORT", "8989"))
 MAX_UPLOAD_MB = int(os.getenv("QWEN_MLX_MAX_UPLOAD_MB", "100"))
@@ -356,6 +355,28 @@ class TranscriptionResult:
     segment_timestamp_source: str = "asr"
     word_timestamp_source: str | None = None
     alignment_status: str = "not_requested"
+
+
+@dataclass
+class AlignmentChunk:
+    text: str
+    canonical_tokens: list[str]
+    words: list[dict[str, Any]]
+    start: float
+    end: float
+
+
+@dataclass
+class AlignmentOutput:
+    words: list[dict[str, Any]] = field(default_factory=list)
+    chunks: list[AlignmentChunk] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TextPart:
+    start: int
+    end: int
+    text: str
 
 
 _CURRENT_REQUEST_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -796,6 +817,7 @@ class MLXAligner:
         self.model_path = model_path
         self._model: Any | None = None
         self._load_lock = Lock()
+        self._processor_lock = Lock()
         # Share the same inference lock as the transcriber to avoid native MLX crashes.
         self._infer_lock = infer_lock or _GLOBAL_INFERENCE_LOCK
         self._load_error: str | None = None
@@ -877,6 +899,25 @@ class MLXAligner:
         self._supported_languages_cache = normalized
         return self._supported_languages_cache
 
+    def canonical_tokens(self, text: str, language: str) -> list[str]:
+        if not text.strip():
+            return []
+
+        self.load(strict=False)
+        if self._model is None:
+            return []
+
+        processor = getattr(self._model, "aligner_processor", None)
+        encode_timestamp = getattr(processor, "encode_timestamp", None)
+        if not callable(encode_timestamp):
+            raise RuntimeError("forced aligner does not expose encode_timestamp")
+
+        # The upstream processor lazily initializes language tokenizers. Serialize
+        # access without counting CPU-only tokenization as native MLX inference.
+        with self._processor_lock:
+            word_list, _input_text = encode_timestamp(text, language)
+        return [str(item) for item in word_list]
+
     def align(
         self,
         audio: str,
@@ -891,7 +932,8 @@ class MLXAligner:
             return []
 
         with self._infer_lock:
-            raw_result = self._model.generate(audio=audio, text=text, language=language)
+            with self._processor_lock:
+                raw_result = self._model.generate(audio=audio, text=text, language=language)
         return _normalize_word_segments(raw_result)
 
 
@@ -1594,6 +1636,64 @@ def _normalize_word_segments(raw: Any) -> list[dict[str, Any]]:
     return words
 
 
+def _aligned_word_tokens(words: list[dict[str, Any]]) -> list[str]:
+    return [str(item.get("word", "")) for item in words]
+
+
+def _token_mismatch_summary(expected: list[str], actual: list[str]) -> str:
+    common_length = min(len(expected), len(actual))
+    mismatch_index = next(
+        (index for index in range(common_length) if expected[index] != actual[index]),
+        common_length,
+    )
+    return (
+        f"expected_tokens={len(expected)} actual_tokens={len(actual)} "
+        f"first_mismatch={mismatch_index}"
+    )
+
+
+def _alignment_text_identity(text: str) -> str:
+    return "".join(character for character in text if character == "'" or character.isalnum())
+
+
+def _text_coverage_mismatch_summary(expected: str, actual: str) -> str:
+    common_length = min(len(expected), len(actual))
+    mismatch_index = next(
+        (index for index in range(common_length) if expected[index] != actual[index]),
+        common_length,
+    )
+    return (
+        f"expected_characters={len(expected)} actual_characters={len(actual)} "
+        f"first_mismatch={mismatch_index}"
+    )
+
+
+def _validate_aligned_word_identity(
+    words: list[dict[str, Any]],
+    canonical_tokens: list[str],
+    *,
+    context: str,
+) -> None:
+    actual_tokens = _aligned_word_tokens(words)
+    if actual_tokens != canonical_tokens:
+        raise RuntimeError(
+            f"{context} token identity mismatch: "
+            f"{_token_mismatch_summary(canonical_tokens, actual_tokens)}"
+        )
+
+
+def _validate_aligned_word_timeline(words: list[dict[str, Any]]) -> None:
+    previous_start = 0.0
+    for index, word in enumerate(words):
+        start = _to_float(word.get("start"), 0.0)
+        end = _to_float(word.get("end"), start)
+        if end < start:
+            raise RuntimeError(f"aligned word has end before start at index={index}")
+        if index > 0 and start + 0.001 < previous_start:
+            raise RuntimeError(f"aligned word timeline is not monotonic at index={index}")
+        previous_start = start
+
+
 def _normalize_timestamp_granularities(value: Any) -> list[str]:
     if value is None:
         return []
@@ -1845,34 +1945,6 @@ def _should_rechunk_segments_for_alignment(
     return len(segments) < expected_chunks
 
 
-def _split_text_evenly(text: str, parts: int) -> list[str]:
-    if parts <= 1:
-        return [text]
-
-    clean = text.strip()
-    if not clean:
-        return [""] * parts
-
-    if " " in clean:
-        tokens = clean.split()
-        joiner = " "
-    else:
-        tokens = list(clean)
-        joiner = ""
-
-    total = len(tokens)
-    if total == 0:
-        return [""] * parts
-
-    slices: list[str] = []
-    for idx in range(parts):
-        start = int(round(idx * total / parts))
-        end = int(round((idx + 1) * total / parts))
-        chunk_tokens = tokens[start:end]
-        slices.append(joiner.join(chunk_tokens).strip())
-    return slices
-
-
 def _segment_text_for_chunks(
     result: TranscriptionResult,
     chunk_ranges: list[tuple[str, float, float]],
@@ -1881,7 +1953,7 @@ def _segment_text_for_chunks(
     # duplicated text across neighboring chunks (which can produce overlapping
     # word timestamps after chunk offset stitching).
     assigned: list[list[str]] = [[] for _ in chunk_ranges]
-    for segment in result.segments:
+    for segment_index, segment in enumerate(result.segments):
         seg_text = str(segment.get("text", "")).strip()
         if not seg_text:
             continue
@@ -1908,25 +1980,22 @@ def _segment_text_for_chunks(
 
         if best_idx < 0:
             continue
+        segment_duration = max(0.0, seg_end - seg_start)
+        if segment_duration <= 0.0:
+            raise RuntimeError(
+                f"alignment chunk assignment requires positive ASR segment duration "
+                f"at index={segment_index}"
+            )
+        if best_overlap + 0.001 < segment_duration:
+            raise RuntimeError(
+                f"ASR segment crosses alignment chunk boundary at index={segment_index} "
+                f"segment_duration={segment_duration:.3f} overlap={best_overlap:.3f}"
+            )
         assigned[best_idx].append(seg_text)
 
-    chunk_texts: list[str] = [" ".join(items).strip() for items in assigned]
-
-    non_empty = [text for text in chunk_texts if text]
-    repeated_full_text = (
-        len(non_empty) > 1
-        and len(set(non_empty)) == 1
-        and non_empty[0] == result.text.strip()
-    )
-
-    if len(non_empty) == len(chunk_texts) and not repeated_full_text:
-        return chunk_texts
-
-    fallback = _split_text_evenly(result.text, len(chunk_ranges))
-    merged: list[str] = []
-    for index, existing in enumerate(chunk_texts):
-        merged.append(existing if existing and not repeated_full_text else fallback[index])
-    return merged
+    # Do not estimate transcript slices for empty chunks. The caller verifies that
+    # the exact canonical tokens from all assigned segment texts cover result.text.
+    return [" ".join(items).strip() for items in assigned]
 
 
 def _segment_end_boundaries_for_alignment(
@@ -2059,12 +2128,37 @@ def _apply_alignment(
     aligner_language: str,
     duration_sec: float | None,
     max_chunk_seconds: float,
-) -> list[dict[str, Any]]:
+) -> AlignmentOutput:
     if not result.text.strip():
-        return []
+        return AlignmentOutput()
 
     if not duration_sec or duration_sec <= max_chunk_seconds:
-        return aligner.align(audio=audio_path, text=result.text, language=aligner_language)
+        canonical_tokens = aligner.canonical_tokens(result.text, aligner_language)
+        words = aligner.align(audio=audio_path, text=result.text, language=aligner_language)
+        _validate_aligned_word_identity(
+            words,
+            canonical_tokens,
+            context="forced alignment",
+        )
+        _validate_aligned_word_timeline(words)
+        chunk_end = max(
+            _to_float(duration_sec, 0.0),
+            max((_to_float(word.get("end"), 0.0) for word in words), default=0.0),
+        )
+        return AlignmentOutput(
+            words=words,
+            chunks=[
+                AlignmentChunk(
+                    text=result.text,
+                    canonical_tokens=canonical_tokens,
+                    words=words,
+                    start=0.0,
+                    end=chunk_end,
+                )
+            ]
+            if canonical_tokens
+            else [],
+        )
 
     split_boundaries = _alignment_chunk_boundaries_from_segments(
         result.segments,
@@ -2080,8 +2174,32 @@ def _apply_alignment(
     chunk_paths = [chunk_path for chunk_path, _, _ in chunk_specs]
     try:
         chunk_texts = _segment_text_for_chunks(result, chunk_specs)
+        chunk_tokens = [
+            aligner.canonical_tokens(chunk_text, aligner_language)
+            if chunk_text.strip()
+            else []
+            for chunk_text in chunk_texts
+        ]
+        alignment_tokens = [
+            token
+            for tokens in chunk_tokens
+            for token in tokens
+        ]
+        expected_text_identity = _alignment_text_identity(result.text)
+        actual_text_identity = _alignment_text_identity(" ".join(chunk_texts))
+        if actual_text_identity != expected_text_identity:
+            raise RuntimeError(
+                "alignment chunk transcript coverage mismatch: "
+                f"{_text_coverage_mismatch_summary(expected_text_identity, actual_text_identity)}"
+            )
+
         aligned_words: list[dict[str, Any]] = []
-        for (chunk_path, chunk_start, chunk_end), chunk_text in zip(chunk_specs, chunk_texts):
+        aligned_chunks: list[AlignmentChunk] = []
+        for (chunk_path, chunk_start, chunk_end), chunk_text, canonical_tokens in zip(
+            chunk_specs,
+            chunk_texts,
+            chunk_tokens,
+        ):
             if not chunk_text.strip():
                 continue
             chunk_duration = max(0.0, float(chunk_end) - float(chunk_start))
@@ -2090,6 +2208,12 @@ def _apply_alignment(
                 text=chunk_text,
                 language=aligner_language,
             )
+            _validate_aligned_word_identity(
+                words,
+                canonical_tokens,
+                context="forced alignment chunk",
+            )
+            offset_words: list[dict[str, Any]] = []
             for word in words:
                 local_start = _to_float(word.get("start"), 0.0)
                 local_end = _to_float(word.get("end"), local_start)
@@ -2105,30 +2229,31 @@ def _apply_alignment(
                     local_start = 0.0
                     local_end = 0.0
 
-                aligned_words.append(
+                offset_words.append(
                     {
                         "word": str(word.get("word", "")),
                         "start": local_start + chunk_start,
                         "end": local_end + chunk_start,
                     }
                 )
-        if duration_sec and duration_sec > 0.0:
-            clamped: list[dict[str, Any]] = []
-            for word in aligned_words:
-                start = _to_float(word.get("start"), 0.0)
-                end = _to_float(word.get("end"), start)
-                start = max(0.0, min(start, duration_sec))
-                end = max(start, min(end, duration_sec))
-                item = {"word": str(word.get("word", "")), "start": start, "end": end}
-                clamped.append(item)
-            aligned_words = clamped
-        aligned_words.sort(
-            key=lambda item: (
-                _to_float(item.get("start"), 0.0),
-                _to_float(item.get("end"), 0.0),
+            aligned_words.extend(offset_words)
+            aligned_chunks.append(
+                AlignmentChunk(
+                    text=chunk_text,
+                    canonical_tokens=canonical_tokens,
+                    words=offset_words,
+                    start=float(chunk_start),
+                    end=float(chunk_end),
+                )
             )
+
+        _validate_aligned_word_identity(
+            aligned_words,
+            alignment_tokens,
+            context="stitched forced alignment",
         )
-        return aligned_words
+        _validate_aligned_word_timeline(aligned_words)
+        return AlignmentOutput(words=aligned_words, chunks=aligned_chunks)
     finally:
         for chunk_path in chunk_paths:
             try:
@@ -2137,159 +2262,186 @@ def _apply_alignment(
                 pass
 
 
-def _split_text_into_sentences(text: str) -> list[str]:
-    content = (text or "").strip()
-    if not content:
+def _text_parts_from_candidate_ends(text: str, candidate_ends: list[int]) -> list[TextPart]:
+    content = text or ""
+    if not content.strip():
         return []
 
-    # Keep sentence-ending punctuation with each sentence.
-    sentence_break_pattern = r"([。！？!?；;]+|\.{2,}|\.)"
-    parts = re.split(sentence_break_pattern, content)
-    sentences: list[str] = []
-    current = ""
-    for part in parts:
-        if not part:
+    parts: list[TextPart] = []
+    cursor = 0
+    for end in sorted(set(candidate_ends)):
+        if end <= cursor or end > len(content):
             continue
-        current += part
-        if re.fullmatch(sentence_break_pattern, part):
-            sentence = current.strip()
-            if sentence:
-                sentences.append(sentence)
-            current = ""
-    if current.strip():
-        sentences.append(current.strip())
-    return sentences
+        raw_part = content[cursor:end]
+        if raw_part.strip():
+            parts.append(TextPart(start=cursor, end=end, text=raw_part.strip()))
+            cursor = end
+
+    if content[cursor:].strip():
+        parts.append(TextPart(start=cursor, end=len(content), text=content[cursor:].strip()))
+    elif parts and parts[-1].end < len(content):
+        last = parts[-1]
+        parts[-1] = TextPart(
+            start=last.start,
+            end=len(content),
+            text=content[last.start:].strip(),
+        )
+
+    if not parts:
+        return [TextPart(start=0, end=len(content), text=content.strip())]
+    return parts
 
 
-def _estimate_sentence_token_units(sentence: str, lang_code: str | None) -> int:
-    text = sentence.strip()
-    if not text:
-        return 0
-
-    code = (lang_code or "").lower()
-    if code == "zh":
-        tokens = re.findall(r"[A-Za-z0-9']+|[\u4e00-\u9fff]", text)
-        return len(tokens)
-    if code == "ja":
-        tokens = re.findall(r"[A-Za-z0-9']+|[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff]", text)
-        return len(tokens)
-    if code == "ko":
-        tokens = re.findall(r"[A-Za-z0-9']+|[가-힣]+", text)
-        return len(tokens)
-
-    tokens = re.findall(r"[A-Za-z0-9']+|[\u4e00-\u9fff]", text)
-    return len(tokens)
+def _split_text_by_boundary_pattern(text: str, pattern: str) -> list[TextPart]:
+    return _text_parts_from_candidate_ends(
+        text,
+        [match.end() for match in re.finditer(pattern, text or "")],
+    )
 
 
-def _allocate_word_counts(total_words: int, weights: list[int]) -> list[int]:
-    if total_words <= 0:
-        return [0] * len(weights)
-    if not weights:
-        return []
+def _sentence_candidate_ends(text: str) -> list[int]:
+    ends = {
+        match.end()
+        for match in re.finditer(r"(?:[。！？!?；;]+|\.{2,})", text)
+    }
+    for match in re.finditer(r"\.", text):
+        index = match.start()
+        previous = text[index - 1] if index > 0 else ""
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if previous == "." or following == ".":
+            continue
+        if previous.isalnum() and following.isalnum():
+            continue
 
-    normalized = [max(0, int(w)) for w in weights]
-    if not any(normalized):
-        normalized = [1] * len(weights)
-
-    total_weight = sum(normalized)
-    raw = [(total_words * w) / total_weight for w in normalized]
-    counts = [int(math.floor(x)) for x in raw]
-
-    # If we have enough words, guarantee at least one word per sentence.
-    if total_words >= len(counts):
-        for i, count in enumerate(counts):
-            if count == 0:
-                counts[i] = 1
-
-    diff = total_words - sum(counts)
-    if diff > 0:
-        fractions = [value - math.floor(value) for value in raw]
-        order = sorted(range(len(counts)), key=lambda i: fractions[i], reverse=True)
-        for i in order:
-            if diff <= 0:
-                break
-            counts[i] += 1
-            diff -= 1
-    elif diff < 0:
-        order = sorted(range(len(counts)), key=lambda i: counts[i], reverse=True)
-        for i in order:
-            while diff < 0 and counts[i] > 1:
-                counts[i] -= 1
-                diff += 1
-            if diff >= 0:
-                break
-
-    return counts
+        prefix = text[: match.end()]
+        suffix = text[match.end() :]
+        if suffix.strip() and re.search(r"(?:\b[A-Za-z]\.){2,}$", prefix):
+            continue
+        ends.add(match.end())
+    return sorted(ends)
 
 
-def _join_words_text(words: list[dict[str, Any]], lang_code: str | None) -> str:
-    code = (lang_code or "").lower()
-    items = [str(item.get("word", "")).strip() for item in words if str(item.get("word", "")).strip()]
-    if code in {"zh", "ja"}:
-        return "".join(items)
-    return " ".join(items)
+def _split_text_into_sentences(text: str) -> list[TextPart]:
+    # Candidate boundaries are verified against canonical tokenizer prefixes later.
+    return _text_parts_from_candidate_ends(text, _sentence_candidate_ends(text))
+
+
+def _safe_token_boundaries(
+    *,
+    text: str,
+    words: list[dict[str, Any]],
+    candidate_ends: list[int],
+    tokenize: Callable[[str], list[str]],
+) -> tuple[dict[int, int], str | None]:
+    canonical_tokens = tokenize(text)
+    actual_tokens = _aligned_word_tokens(words)
+    if canonical_tokens != actual_tokens:
+        return {}, _token_mismatch_summary(canonical_tokens, actual_tokens)
+
+    safe_boundaries: dict[int, int] = {}
+    for end in sorted(set(candidate_ends)):
+        if end <= 0 or end >= len(text):
+            continue
+        prefix_tokens = tokenize(text[:end])
+        token_count = len(prefix_tokens)
+        if not 0 < token_count < len(canonical_tokens):
+            continue
+        if prefix_tokens == canonical_tokens[:token_count]:
+            # Prefer the furthest character position for an equivalent token
+            # boundary so punctuation and whitespace stay with the prior part.
+            safe_boundaries[token_count] = max(
+                end,
+                safe_boundaries.get(token_count, 0),
+            )
+
+    return safe_boundaries, None
+
+
+def _segments_from_token_boundaries(
+    *,
+    text: str,
+    words: list[dict[str, Any]],
+    token_boundaries: dict[int, int],
+    selected_token_counts: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    selected = sorted(
+        set(selected_token_counts if selected_token_counts is not None else token_boundaries)
+    )
+    selected = [count for count in selected if 0 < count < len(words)]
+
+    segments: list[dict[str, Any]] = []
+    word_cursor = 0
+    char_cursor = 0
+    for word_end in [*selected, len(words)]:
+        char_end = token_boundaries.get(word_end, len(text))
+        chunk_words = words[word_cursor:word_end]
+        segment_text = text[char_cursor:char_end].strip()
+        if not chunk_words or not segment_text:
+            return [], (
+                f"empty exact segment at token_start={word_cursor} "
+                f"token_end={word_end}"
+            )
+
+        start = _to_float(chunk_words[0].get("start"), 0.0)
+        end = _to_float(chunk_words[-1].get("end"), start)
+        segments.append(
+            {
+                "id": len(segments),
+                "start": max(0.0, start),
+                "end": max(max(0.0, start), end),
+                "text": segment_text,
+                "_words": chunk_words,
+            }
+        )
+        word_cursor = word_end
+        char_cursor = char_end
+
+    if word_cursor != len(words):
+        return [], f"exact segment mapping consumed={word_cursor} total={len(words)}"
+    return segments, None
+
+
+def _map_text_parts_to_word_segments(
+    *,
+    text: str,
+    words: list[dict[str, Any]],
+    parts: list[TextPart],
+    tokenize: Callable[[str], list[str]],
+) -> tuple[list[dict[str, Any]], str | None]:
+    safe_boundaries, error = _safe_token_boundaries(
+        text=text,
+        words=words,
+        candidate_ends=[part.end for part in parts],
+        tokenize=tokenize,
+    )
+    if error is not None:
+        return [], error
+    return _segments_from_token_boundaries(
+        text=text,
+        words=words,
+        token_boundaries=safe_boundaries,
+    )
 
 
 def _build_sentence_segments_from_words(
     words: list[dict[str, Any]],
     text: str,
     lang_code: str | None,
-) -> list[dict[str, Any]]:
+    tokenize: Callable[[str], list[str]],
+) -> tuple[list[dict[str, Any]], str | None]:
     if not words:
-        return []
+        return [], None
 
     sentences = _split_text_into_sentences(text)
     if not sentences:
-        return []
+        return [], "sentence splitter returned no text parts"
 
-    weights = [max(1, _estimate_sentence_token_units(sentence, lang_code)) for sentence in sentences]
-    counts = _allocate_word_counts(len(words), weights)
-    if not counts:
-        return []
-
-    segments: list[dict[str, Any]] = []
-    cursor = 0
-    for sentence, count in zip(sentences, counts):
-        if cursor >= len(words):
-            break
-        if count <= 0:
-            continue
-        chunk_words = words[cursor : min(len(words), cursor + count)]
-        if not chunk_words:
-            continue
-        start = _to_float(chunk_words[0].get("start"), 0.0)
-        end = _to_float(chunk_words[-1].get("end"), start)
-        seg_text = sentence.strip() or _join_words_text(chunk_words, lang_code)
-        if not seg_text:
-            seg_text = _join_words_text(chunk_words, lang_code)
-        segments.append(
-            {
-                "id": len(segments),
-                "start": max(0.0, start),
-                "end": max(max(0.0, start), end),
-                "text": seg_text,
-                "_words": chunk_words,
-            }
-        )
-        cursor += len(chunk_words)
-
-    if cursor < len(words):
-        remainder = words[cursor:]
-        start = _to_float(remainder[0].get("start"), 0.0)
-        end = _to_float(remainder[-1].get("end"), start)
-        seg_text = _join_words_text(remainder, lang_code)
-        if seg_text:
-            segments.append(
-                {
-                    "id": len(segments),
-                    "start": max(0.0, start),
-                    "end": max(max(0.0, start), end),
-                    "text": seg_text,
-                    "_words": remainder,
-                }
-            )
-
-    return [segment for segment in segments if segment.get("text")]
+    return _map_text_parts_to_word_segments(
+        text=text,
+        words=words,
+        parts=sentences,
+        tokenize=tokenize,
+    )
 
 
 def _join_segment_texts(texts: list[str], lang_code: str | None) -> str:
@@ -2373,120 +2525,108 @@ def _merge_segments_by_target_duration(
     return merged
 
 
-def _split_text_by_punctuation_pattern(text: str, pattern: str) -> list[str]:
-    content = (text or "").strip()
-    if not content:
-        return []
-
-    tokens = re.split(f"({pattern})", content)
-    if len(tokens) <= 1:
-        return [content]
-
-    pieces: list[str] = []
-    current = ""
-    for token in tokens:
-        if not token:
-            continue
-        current += token
-        if re.fullmatch(pattern, token):
-            item = current.strip()
-            if item:
-                pieces.append(item)
-            current = ""
-    if current.strip():
-        pieces.append(current.strip())
-    return pieces or [content]
+def _split_text_by_punctuation_pattern(text: str, pattern: str) -> list[TextPart]:
+    return _split_text_by_boundary_pattern(text, f"(?:{pattern})")
 
 
 def _build_subsegments_from_text_parts(
     segment: dict[str, Any],
-    parts: list[str],
+    parts: list[TextPart],
+    tokenize: Callable[[str], list[str]],
+) -> tuple[list[dict[str, Any]], str | None]:
+    if not parts:
+        return [], "subsegment splitter returned no text parts"
+
+    segment_words = segment.get("_words")
+    if not isinstance(segment_words, list) or not segment_words:
+        return [], "exact subsegment mapping requires aligned words"
+
+    return _map_text_parts_to_word_segments(
+        text=str(segment.get("text", "")),
+        words=segment_words,
+        parts=parts,
+        tokenize=tokenize,
+    )
+
+
+def _broad_token_boundary_candidates(text: str, lang_code: str | None) -> list[int]:
+    candidates = {match.end() for match in re.finditer(r"(?:\s+|[^\w\s]+)", text)}
+    if (lang_code or "").lower() in {"zh", "ja"}:
+        candidates.update(range(1, len(text)))
+    candidates.add(len(text))
+    return sorted(candidates)
+
+
+def _select_hard_limit_token_boundaries(
+    words: list[dict[str, Any]],
+    available_token_counts: list[int],
+    hard_max_seconds: float,
+) -> list[int]:
+    selected: list[int] = []
+    cursor = 0
+    available = sorted(count for count in set(available_token_counts) if 0 < count < len(words))
+    while cursor < len(words):
+        segment_start = _to_float(words[cursor].get("start"), 0.0)
+        remaining_end = _to_float(words[-1].get("end"), segment_start)
+        if remaining_end - segment_start <= hard_max_seconds:
+            break
+
+        after_cursor = [count for count in available if count > cursor]
+        if not after_cursor:
+            break
+        within_limit = [
+            count
+            for count in after_cursor
+            if _to_float(words[count - 1].get("end"), segment_start) - segment_start
+            <= hard_max_seconds
+        ]
+        chosen = max(within_limit) if within_limit else min(after_cursor)
+        selected.append(chosen)
+        cursor = chosen
+
+    return selected
+
+
+def _build_hard_limit_subsegments(
+    segment: dict[str, Any],
     lang_code: str | None,
+    hard_max_seconds: float,
+    tokenize: Callable[[str], list[str]],
 ) -> list[dict[str, Any]]:
-    filtered_parts = [part.strip() for part in parts if part and part.strip()]
-    if not filtered_parts:
+    text = str(segment.get("text", ""))
+    segment_words = segment.get("_words")
+    if not text.strip() or not isinstance(segment_words, list) or not segment_words:
         return []
 
-    start = _to_float(segment.get("start"), 0.0)
-    end = _to_float(segment.get("end"), start)
-    duration = max(0.0, end - start)
-    if duration <= 0:
-        return [
-            {"id": 0, "start": start, "end": start, "text": part}
-            for part in filtered_parts
-        ]
-
-    weights = [max(1, _estimate_sentence_token_units(part, lang_code)) for part in filtered_parts]
-    total_weight = float(sum(weights)) if weights else float(len(filtered_parts))
-    segment_words = segment.get("_words")
-    if isinstance(segment_words, list) and segment_words:
-        counts = _allocate_word_counts(len(segment_words), weights)
-        if counts:
-            subsegments: list[dict[str, Any]] = []
-            cursor_index = 0
-            last_end = start
-            for idx, (part, count) in enumerate(zip(filtered_parts, counts)):
-                if idx == len(filtered_parts) - 1:
-                    sub_words = segment_words[cursor_index:]
-                else:
-                    take = max(0, int(count))
-                    sub_words = segment_words[cursor_index : min(len(segment_words), cursor_index + take)]
-                if sub_words:
-                    sub_start = _to_float(sub_words[0].get("start"), last_end)
-                    sub_end = _to_float(sub_words[-1].get("end"), sub_start)
-                    cursor_index += len(sub_words)
-                else:
-                    # Fallback when allocation yields an empty bucket.
-                    if idx == len(filtered_parts) - 1:
-                        sub_start = last_end
-                        sub_end = end
-                    else:
-                        ratio = (
-                            float(weights[idx]) / total_weight if total_weight > 0 else 1.0 / len(filtered_parts)
-                        )
-                        sub_start = last_end
-                        sub_end = min(end, sub_start + (duration * ratio))
-                if sub_end < sub_start:
-                    sub_end = sub_start
-                entry: dict[str, Any] = {
-                    "id": idx,
-                    "start": sub_start,
-                    "end": sub_end,
-                    "text": part,
-                }
-                if sub_words:
-                    entry["_words"] = sub_words
-                subsegments.append(entry)
-                last_end = sub_end
-            return subsegments
-
-    subsegments: list[dict[str, Any]] = []
-    cursor = start
-    for idx, (part, weight) in enumerate(zip(filtered_parts, weights)):
-        if idx == len(filtered_parts) - 1:
-            sub_end = end
-        else:
-            ratio = float(weight) / total_weight if total_weight > 0 else 1.0 / len(filtered_parts)
-            sub_end = min(end, cursor + (duration * ratio))
-        if sub_end < cursor:
-            sub_end = cursor
-        subsegments.append(
-            {
-                "id": idx,
-                "start": cursor,
-                "end": sub_end,
-                "text": part,
-            }
-        )
-        cursor = sub_end
-
-    return subsegments
+    safe_boundaries, error = _safe_token_boundaries(
+        text=text,
+        words=segment_words,
+        candidate_ends=_broad_token_boundary_candidates(text, lang_code),
+        tokenize=tokenize,
+    )
+    if error is not None:
+        return []
+    selected = _select_hard_limit_token_boundaries(
+        segment_words,
+        list(safe_boundaries),
+        hard_max_seconds,
+    )
+    if not selected:
+        return []
+    subsegments, error = _segments_from_token_boundaries(
+        text=text,
+        words=segment_words,
+        token_boundaries=safe_boundaries,
+        selected_token_counts=selected,
+    )
+    return subsegments if error is None else []
 
 
 def _split_long_segment_once(
     segment: dict[str, Any],
     lang_code: str | None,
     hard_max_seconds: float,
+    tokenize: Callable[[str], list[str]],
 ) -> list[dict[str, Any]]:
     text = str(segment.get("text", "")).strip()
     start = _to_float(segment.get("start"), 0.0)
@@ -2498,22 +2638,40 @@ def _split_long_segment_once(
     # Priority 1: split by comma.
     comma_parts = _split_text_by_punctuation_pattern(text, r"[，,]")
     if len(comma_parts) > 1:
-        return _build_subsegments_from_text_parts(segment, comma_parts, lang_code)
+        subsegments, error = _build_subsegments_from_text_parts(
+            segment,
+            comma_parts,
+            tokenize,
+        )
+        if error is None and len(subsegments) > 1:
+            return subsegments
 
     # Priority 2: split by other punctuation.
     other_parts = _split_text_by_punctuation_pattern(text, r"[、；;:：。！？!?]+")
     if len(other_parts) > 1:
-        return _build_subsegments_from_text_parts(segment, other_parts, lang_code)
+        subsegments, error = _build_subsegments_from_text_parts(
+            segment,
+            other_parts,
+            tokenize,
+        )
+        if error is None and len(subsegments) > 1:
+            return subsegments
 
-    # Final fallback: even split by duration.
-    chunks = max(2, int(math.ceil(duration / max(0.1, hard_max_seconds))))
-    fallback_parts = _split_text_evenly(text, chunks)
-    return _build_subsegments_from_text_parts(segment, fallback_parts, lang_code)
+    # Final fallback: split only at tokenizer-verified word boundaries. If no
+    # exact boundary exists, preserve the longer correct segment.
+    exact_subsegments = _build_hard_limit_subsegments(
+        segment,
+        lang_code,
+        hard_max_seconds,
+        tokenize,
+    )
+    return exact_subsegments if len(exact_subsegments) > 1 else [segment]
 
 
 def _enforce_hard_duration_limit(
     segments: list[dict[str, Any]],
     lang_code: str | None,
+    tokenize: Callable[[str], list[str]],
     hard_max_seconds: float = 6.0,
 ) -> list[dict[str, Any]]:
     if not segments:
@@ -2544,7 +2702,12 @@ def _enforce_hard_duration_limit(
             output.append(item)
             continue
 
-        parts = _split_long_segment_once(current, lang_code, hard_max_seconds)
+        parts = _split_long_segment_once(
+            current,
+            lang_code,
+            hard_max_seconds,
+            tokenize,
+        )
         if len(parts) <= 1:
             item: dict[str, Any] = {"id": 0, "start": start, "end": end, "text": text}
             seg_words = current.get("_words")
@@ -2569,75 +2732,41 @@ def _enforce_hard_duration_limit(
 
     for idx, item in enumerate(output):
         item["id"] = idx
-        item.pop("_words", None)
     return output
 
 
-def _build_pause_segments_from_words(
-    words: list[dict[str, Any]],
-    lang_code: str | None,
-    pause_threshold_sec: float = 0.75,
-    max_words_per_segment: int = 28,
-) -> list[dict[str, Any]]:
-    if not words:
-        return []
-
-    segments: list[dict[str, Any]] = []
-    chunk: list[dict[str, Any]] = []
-    prev_end = None
-
-    def flush_chunk() -> None:
-        nonlocal chunk
-        if not chunk:
-            return
-        start = _to_float(chunk[0].get("start"), 0.0)
-        end = _to_float(chunk[-1].get("end"), start)
-        seg_text = _join_words_text(chunk, lang_code)
-        if seg_text:
-            segments.append(
-                {
-                    "id": len(segments),
-                    "start": max(0.0, start),
-                    "end": max(max(0.0, start), end),
-                    "text": seg_text,
-                    "_words": list(chunk),
-                }
-            )
-        chunk = []
-
-    for word in words:
-        start = _to_float(word.get("start"), 0.0)
-        end = _to_float(word.get("end"), start)
-        if chunk:
-            gap = start - float(prev_end or start)
-            if gap >= pause_threshold_sec or len(chunk) >= max_words_per_segment:
-                flush_chunk()
-        chunk.append({"word": word.get("word", ""), "start": start, "end": end})
-        prev_end = end
-
-    flush_chunk()
-    return segments
-
-
-def _rebuild_segments_from_words(
+def _rebuild_segments_from_alignment(
     *,
-    words: list[dict[str, Any]],
-    text: str,
+    alignment: AlignmentOutput,
+    aligner: MLXAligner,
+    aligner_language: str,
     lang_code: str | None,
-) -> list[dict[str, Any]]:
-    if not words:
-        return []
+) -> tuple[list[dict[str, Any]], str | None]:
+    if not alignment.words:
+        return [], None
 
-    rebuilt = _build_sentence_segments_from_words(words, text, lang_code)
-    if not rebuilt:
-        rebuilt = _build_pause_segments_from_words(
-            words,
+    def tokenize(text: str) -> list[str]:
+        return aligner.canonical_tokens(text, aligner_language)
+
+    rebuilt: list[dict[str, Any]] = []
+    for chunk_index, chunk in enumerate(alignment.chunks):
+        chunk_word_tokens = _aligned_word_tokens(chunk.words)
+        if chunk_word_tokens != chunk.canonical_tokens:
+            return [], (
+                f"chunk={chunk_index} preserved token identity mismatch: "
+                f"{_token_mismatch_summary(chunk.canonical_tokens, chunk_word_tokens)}"
+            )
+        chunk_segments, error = _build_sentence_segments_from_words(
+            chunk.words,
+            chunk.text,
             lang_code,
-            pause_threshold_sec=SEGMENT_PAUSE_THRESHOLD_SECONDS,
-            max_words_per_segment=max(1, SEGMENT_MAX_WORDS_PER_SEGMENT),
+            tokenize,
         )
+        if error is not None:
+            return [], f"chunk={chunk_index} {error}"
+        rebuilt.extend(chunk_segments)
     if not rebuilt:
-        return []
+        return [], "exact sentence mapping produced no segments"
 
     if SEGMENT_MERGE_TARGET_SECONDS > 0.0:
         rebuilt = _merge_segments_by_target_duration(
@@ -2649,10 +2778,23 @@ def _rebuild_segments_from_words(
         rebuilt = _enforce_hard_duration_limit(
             rebuilt,
             lang_code,
+            tokenize,
             hard_max_seconds=SEGMENT_HARD_MAX_SECONDS,
         )
 
-    return _normalize_segments(rebuilt)
+    rebuilt_words: list[dict[str, Any]] = []
+    for segment in rebuilt:
+        segment_words = segment.get("_words")
+        if not isinstance(segment_words, list) or not segment_words:
+            return [], "rebuilt segment lost aligned word identity"
+        rebuilt_words.extend(segment_words)
+    if _aligned_word_tokens(rebuilt_words) != _aligned_word_tokens(alignment.words):
+        return [], (
+            "rebuilt segments do not partition aligned words: "
+            f"{_token_mismatch_summary(_aligned_word_tokens(alignment.words), _aligned_word_tokens(rebuilt_words))}"
+        )
+
+    return _normalize_segments(rebuilt), None
 
 
 def _to_float(value: Any, default: float) -> float:
@@ -3458,7 +3600,7 @@ async def _run_transcription_pipeline(
                     logger.warning("[%s] Alignment skipped: %s", request_id, missing_dep)
                     return result
                 try:
-                    aligned_words = await _run_blocking_safely(
+                    alignment_output = await _run_blocking_safely(
                         request_id,
                         _apply_alignment,
                         aligner,
@@ -3481,14 +3623,16 @@ async def _run_transcription_pipeline(
                         align_exc,
                     )
                 else:
+                    aligned_words = alignment_output.words
                     result.words = aligned_words
                     result.word_timestamp_source = "forced_alignment" if aligned_words else None
                     result.alignment_status = "applied" if aligned_words else "empty"
                     if SEGMENT_REBUILD_FROM_WORDS and aligned_words:
                         source_segments = [dict(segment) for segment in result.segments]
-                        rebuilt_segments = _rebuild_segments_from_words(
-                            words=aligned_words,
-                            text=result.text,
+                        rebuilt_segments, rebuild_error = _rebuild_segments_from_alignment(
+                            alignment=alignment_output,
+                            aligner=aligner,
+                            aligner_language=aligner_language,
                             lang_code=detected_language_code,
                         )
                         if rebuilt_segments:
@@ -3502,6 +3646,12 @@ async def _run_transcription_pipeline(
                                 "[%s] sentence_segments=on segments_rebuilt=%d",
                                 request_id,
                                 len(result.segments),
+                            )
+                        elif rebuild_error is not None:
+                            logger.warning(
+                                "[%s] sentence_segments=skipped reason=%s",
+                                request_id,
+                                rebuild_error,
                             )
                     logger.info(
                         "[%s] forced_alignment=%s words=%d segments=%d lang=%s duration=%.2fs",

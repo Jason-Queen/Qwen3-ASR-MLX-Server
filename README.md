@@ -191,6 +191,7 @@ uv run --python 3.11 qwen3-asr-mlx-server --log-prompts
 - `/healthz` 返回 ASR 模型、可选 aligner、admission/队列 readiness，以及 admission、推理锁等待、解码音频内存、进程 peak RSS 和取消累计指标。必需的 ASR 模型未就绪或 admission 已满时返回 `503`；可选 aligner 不可用会明确显示，但不会阻止纯文本转录。
 - 普通 `json` 与 `text` 是纯文本契约。对这两种格式显式设置 `alignment=on`、`word_timestamps=true` 或 `timestamp_granularities` 时返回 `400`，不会再执行对齐后隐藏结果。JSON 时间戳请使用 `verbose_json`，字幕请使用 `srt`/`vtt`；Chat Completions 仍为纯文本响应并拒绝时间戳输出控制。
 - 自动 forced alignment 只会用于可消费时间戳的输出（`verbose_json`、`srt`、`vtt`）。
+- forced alignment 的句段重建使用 aligner 自身的 canonical tokenizer 做逐项校验；每个对齐词只会被精确消费一次，不再按估算词数分配。若对齐词身份或分块文本覆盖无法验证，本次 alignment 会失败（显式请求返回错误，自动模式保留 ASR 结果）；若仅句界映射无法验证，服务仍可返回已验证的词时间，但会保留 ASR 句段及其时间来源，不会把近似句界标记为 forced alignment。
 - `zh/en/ja/ko` 的自动 forced alignment 会按运行时依赖自动判定：
   - `zh/en`：需要 aligner 模型可用
   - `ja`：需要 aligner + `nagisa`
