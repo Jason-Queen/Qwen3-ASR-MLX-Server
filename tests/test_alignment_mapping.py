@@ -253,8 +253,8 @@ class AlignmentChunkContractTests(UpstreamTokenizerTestCase):
         with wave.open(wav_path, "wb") as wav_file:
             wav_file.setnchannels(1)
             wav_file.setsampwidth(2)
-            wav_file.setframerate(10)
-            wav_file.writeframes(b"\x00\x00" * int(duration_seconds * 10))
+            wav_file.setframerate(100)
+            wav_file.writeframes(b"\x00\x00" * int(duration_seconds * 100))
         return wav_path
 
     def test_long_alignment_preserves_chunk_text_and_word_order(self) -> None:
@@ -344,6 +344,34 @@ class AlignmentChunkContractTests(UpstreamTokenizerTestCase):
 
         self.assertEqual(aligner.calls, [])
 
+    def test_long_alignment_accepts_padded_final_asr_segment(self) -> None:
+        wav_path = self.make_wav(duration_seconds=30.5)
+        aligner = FakeAligner(self.processor)
+        result = server.TranscriptionResult(
+            text="alpha. tail.",
+            language="en",
+            segments=[
+                {"id": 0, "start": 0.0, "end": 30.25, "text": "alpha."},
+                {"id": 1, "start": 30.25, "end": 31.25, "text": "tail."},
+            ],
+            duration=30.5,
+        )
+        try:
+            output = server._apply_alignment(
+                aligner,
+                wav_path,
+                result,
+                "English",
+                30.5,
+                30.0,
+            )
+        finally:
+            Path(wav_path).unlink(missing_ok=True)
+
+        self.assertEqual([chunk.text for chunk in output.chunks], ["alpha.", "tail."])
+        self.assertEqual(len(aligner.calls), 2)
+        self.assertEqual(output.words[-1]["end"], 30.5)
+
     def test_segment_rebuild_consumes_each_alignment_chunk_exactly(self) -> None:
         aligner = FakeAligner(self.processor)
         first_text = "alpha beta."
@@ -375,6 +403,34 @@ class AlignmentChunkContractTests(UpstreamTokenizerTestCase):
         self.assertEqual([segment["text"] for segment in segments], [first_text, second_text])
         self.assertEqual([segment["start"] for segment in segments], [0.0, 3.0])
         self.assertEqual([segment["end"] for segment in segments], [1.6, 4.6])
+
+    def test_segment_rebuild_rejects_nonempty_tokenless_chunk(self) -> None:
+        aligner = FakeAligner(self.processor)
+        first_text = "Hello"
+        first_tokens = aligner.canonical_tokens(first_text, "English")
+        first_words = self.timed_words(first_tokens)
+        alignment = server.AlignmentOutput(
+            words=first_words,
+            chunks=[
+                server.AlignmentChunk(first_text, first_tokens, first_words, 0.0, 1.0),
+                server.AlignmentChunk("...", [], [], 1.0, 2.0),
+            ],
+        )
+
+        with (
+            mock.patch.object(server, "SEGMENT_MERGE_TARGET_SECONDS", 0.0),
+            mock.patch.object(server, "SEGMENT_HARD_MAX_SECONDS", 0.0),
+        ):
+            segments, error = server._rebuild_segments_from_alignment(
+                alignment=alignment,
+                aligner=aligner,
+                aligner_language="English",
+                lang_code="en",
+            )
+
+        self.assertEqual(segments, [])
+        self.assertIsNotNone(error)
+        self.assertIn("non-empty text has no canonical tokens", str(error))
 
 
 class AlignmentFallbackProvenanceTests(UpstreamTokenizerTestCase):
@@ -436,6 +492,62 @@ class AlignmentFallbackProvenanceTests(UpstreamTokenizerTestCase):
             )
 
         self.assertEqual(result.segments, source.segments)
+        self.assertEqual(result.segment_timestamp_source, "asr")
+        self.assertEqual(result.words, words)
+        self.assertEqual(result.word_timestamp_source, "forced_alignment")
+        self.assertEqual(result.alignment_status, "applied")
+
+    def test_tokenless_chunk_keeps_punctuation_only_asr_segment(self) -> None:
+        source_segments = [
+            {"id": 0, "start": 0.0, "end": 0.05, "text": "Hello"},
+            {"id": 1, "start": 0.05, "end": 0.1, "text": "..."},
+        ]
+        source = server.TranscriptionResult(
+            text="Hello ...",
+            language="en",
+            segments=source_segments,
+            duration=0.1,
+            segment_timestamp_source="asr",
+        )
+        words = self.timed_words(["Hello"], step=0.04, width=0.03)
+        alignment = server.AlignmentOutput(
+            words=words,
+            chunks=[
+                server.AlignmentChunk("Hello", ["Hello"], words, 0.0, 0.05),
+                server.AlignmentChunk("...", [], [], 0.05, 0.1),
+            ],
+        )
+
+        with (
+            mock.patch.object(server.transcriber, "transcribe", return_value=source),
+            mock.patch.object(server.aligner, "is_ready", return_value=True),
+            mock.patch.object(
+                server.aligner,
+                "canonical_tokens",
+                side_effect=lambda text, language: self.processor.encode_timestamp(
+                    text,
+                    language,
+                )[0],
+            ),
+            mock.patch.object(server, "_effective_auto_align_lang_codes", return_value={"en"}),
+            mock.patch.object(server, "_should_rechunk_segments_for_alignment", return_value=False),
+            mock.patch.object(server, "_alignment_dependency_missing", return_value=None),
+            mock.patch.object(server, "_apply_alignment", return_value=alignment),
+        ):
+            result = asyncio.run(
+                server._run_transcription_pipeline(
+                    request_id="tokenless-fallback-test",
+                    audio_bytes=self.make_wav_bytes(),
+                    file_name="audio.wav",
+                    language="en",
+                    prompt=None,
+                    alignment_mode="on",
+                    response_format="verbose_json",
+                    timestamp_granularities=["word"],
+                )
+            )
+
+        self.assertEqual(result.segments, source_segments)
         self.assertEqual(result.segment_timestamp_source, "asr")
         self.assertEqual(result.words, words)
         self.assertEqual(result.word_timestamp_source, "forced_alignment")

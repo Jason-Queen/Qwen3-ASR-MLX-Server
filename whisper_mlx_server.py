@@ -1953,6 +1953,13 @@ def _segment_text_for_chunks(
     # duplicated text across neighboring chunks (which can produce overlapping
     # word timestamps after chunk offset stitching).
     assigned: list[list[str]] = [[] for _ in chunk_ranges]
+    audio_end = max((chunk_end for _, _, chunk_end in chunk_ranges), default=0.0)
+    nonempty_segment_indexes = [
+        index
+        for index, segment in enumerate(result.segments)
+        if str(segment.get("text", "")).strip()
+    ]
+    final_segment_index = nonempty_segment_indexes[-1] if nonempty_segment_indexes else -1
     for segment_index, segment in enumerate(result.segments):
         seg_text = str(segment.get("text", "")).strip()
         if not seg_text:
@@ -1961,6 +1968,14 @@ def _segment_text_for_chunks(
         seg_end = _to_float(segment.get("end"), seg_start)
         if seg_end < seg_start:
             seg_end = seg_start
+        if (
+            segment_index == final_segment_index
+            and seg_start < audio_end < seg_end
+        ):
+            # mlx-audio pads a final ASR chunk shorter than its minimum chunk
+            # duration and reports the padded end time. Clip only that final
+            # segment to the real WAV timeline; internal crossings still fail.
+            seg_end = audio_end
 
         best_idx = -1
         best_overlap = -1.0
@@ -2742,6 +2757,9 @@ def _rebuild_segments_from_alignment(
     aligner_language: str,
     lang_code: str | None,
 ) -> tuple[list[dict[str, Any]], str | None]:
+    for chunk_index, chunk in enumerate(alignment.chunks):
+        if chunk.text.strip() and not chunk.canonical_tokens:
+            return [], f"chunk={chunk_index} non-empty text has no canonical tokens"
     if not alignment.words:
         return [], None
 
@@ -3800,7 +3818,7 @@ class AdmissionMetricsMiddleware:
 
 transcriber = MLXTranscriber(model_path=MODEL_PATH)
 aligner = MLXAligner(model_path=ALIGNER_PATH)
-app = FastAPI(title="Qwen3-ASR-MLX-Server", version="1.1.1")
+app = FastAPI(title="Qwen3-ASR-MLX-Server", version="1.1.2")
 
 app.add_middleware(AdmissionMetricsMiddleware, metrics=runtime_metrics)
 app.add_middleware(
