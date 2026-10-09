@@ -24,6 +24,34 @@ Ready for use with Spokenly, OpenWhispr, and other OpenAI-compatible transcripti
 - Optional forced alignment (word timestamps) with Qwen3-ForcedAligner
 - Terminal-based interactive setup flow
 
+## Standalone forced alignment (v1.3.0)
+
+Align an existing authoritative transcript without running ASR:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8989/v1/audio/alignments \
+  -F 'file=@recording.wav' -F 'text=<transcript.txt' -F 'language=en'
+
+uv run qwen3-asr-mlx-server align recording.wav \
+  --text-file transcript.txt --language en \
+  --response-format verbose_json --output alignment.json
+```
+
+`/audio/alignments` is an alias. Outputs are `verbose_json` (default), `srt`, or
+`vtt`. The supplied text is preserved exactly; results identify `task=align` and
+forced-alignment provenance. Language is required, and the align-only CLI needs
+only the aligner model. Transcription and Chat APIs retain their existing contracts.
+
+Direct windows support up to 30 seconds, 256 canonical alignment units, and 2048
+encoded text/timestamp tokens. Longer sources require explicit audio/text regions
+through HTTP `regions` or CLI `--regions-file`. No ASR fallback or guessed text
+splits are used. JSON reports zero-duration words and timing diagnostics; structural
+coverage does not establish acoustic accuracy.
+
+See the [full alignment guide](docs/forced-alignment.md) for region schemas,
+Unicode offsets, all resource limits, languages, readiness, error codes, and
+subtitle restrictions. Check it with `scripts/smoke_alignment.sh PORT AUDIO TEXT_FILE LANGUAGE`.
+
 ## Model Policy
 
 This project only supports Qwen3-ASR MLX model naming (full precision + quantized variants), for example:
@@ -219,6 +247,8 @@ Chunk size tuning guidance:
 - `QWEN_MLX_ALIGNMENT_BOUNDARY_TOLERANCE_SECONDS=0` restores fixed-duration hard cuts.
 
 ## Notes
+
+The following task, language, and output-format notes describe the transcription APIs; see the standalone alignment guide for `align`.
 
 - `task=transcribe` is supported; `translate` is rejected.
 - To avoid native MLX crashes under load, transcription and forced alignment inference stay serialized inside a single process. Admission allows one executing request plus `QWEN_MLX_MAX_QUEUE_DEPTH` in-flight waiters per process; excess requests receive `429` with `Retry-After: 1`.

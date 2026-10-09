@@ -27,6 +27,8 @@ from pathlib import Path
 from threading import Event, Lock
 from typing import Any
 
+import forced_alignment as forced
+
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
@@ -50,7 +52,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_HF_ASR_REPO_ID = "mlx-community/Qwen3-ASR-1.7B-bf16"
 DEFAULT_HF_ALIGNER_REPO_ID = "mlx-community/Qwen3-ForcedAligner-0.6B-bf16"
 SETUP_COMMAND_HINT = "python qwen3_asr_mlx_server.py setup"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 DEFAULT_MAX_TOKENS = 8192
 AUTO_TOKEN_BUDGET_WINDOW_SECONDS = 1200.0
 PROCESSED_DURATION_TOLERANCE_SECONDS = 0.05
@@ -818,6 +820,27 @@ class MLXTranscriber:
                         pass
 
 
+class _RawTimestampProcessor:
+    """Use upstream tokenization while bypassing its interpolating timestamp repair."""
+
+    def __init__(self, processor: Any) -> None:
+        self.processor = processor
+        self.parsed = False
+
+    def encode_timestamp(self, text: str, language: str) -> Any:
+        return self.processor.encode_timestamp(text, language)
+
+    def parse_timestamp(self, words: list[str], timestamps: Any) -> list[dict[str, Any]]:
+        values = timestamps.tolist()
+        if not isinstance(values, list) or len(values) != len(words) * 2:
+            raise forced.AlignmentOutputError("Forced aligner returned an invalid timestamp slot count")
+        self.parsed = True
+        return [
+            {"text": word, "start_time": values[index * 2], "end_time": values[index * 2 + 1]}
+            for index, word in enumerate(words)
+        ]
+
+
 class MLXAligner:
     def __init__(self, model_path: str, infer_lock: Lock | None = None) -> None:
         self.model_path = model_path
@@ -941,6 +964,69 @@ class MLXAligner:
             with self._processor_lock:
                 raw_result = self._model.generate(audio=audio, text=text, language=language)
         return _normalize_word_segments(raw_result)
+
+    def prepare_standalone(self, texts: list[str], full_text: str, language: str) -> list[list[str]]:
+        # Loading weights can use native MLX. It shares admission/cancellation and
+        # the process-wide inference lock even when ASR has never been loaded.
+        with self._infer_lock:
+            self.load(strict=True)
+        supported = self.supported_languages()
+        if not supported or language.lower() not in supported:
+            raise forced.AlignmentInputError(
+                "Unsupported alignment language; supported model languages: "
+                + ", ".join(sorted(supported or []))
+            )
+        resolution = getattr(self._model.config, "timestamp_segment_time", None)
+        if resolution != forced.TIMESTAMP_RESOLUTION_SECONDS * 1000:
+            raise RuntimeError("Standalone alignment requires the tested 80 ms timestamp model")
+        token_lists: list[list[str]] = []
+        with self._processor_lock:
+            for index, text in enumerate(texts):
+                tokens, encoded = self._model.aligner_processor.encode_timestamp(text, language)
+                if not tokens:
+                    raise forced.AlignmentInputError(f"Region {index} contains no alignable tokens")
+                if len(tokens) > forced.MAX_WINDOW_UNITS:
+                    raise forced.AlignmentInputError(
+                        f"Region {index} exceeds {forced.MAX_WINDOW_UNITS} alignment units; supply smaller explicit regions"
+                    )
+                input_ids = self._model._tokenizer.encode(encoded, add_special_tokens=False)
+                if len(input_ids) > forced.MAX_WINDOW_TEXT_TOKENS:
+                    raise forced.AlignmentInputError(
+                        f"Region {index} exceeds {forced.MAX_WINDOW_TEXT_TOKENS} encoded text/timestamp tokens; supply smaller explicit regions"
+                    )
+                token_lists.append(list(tokens))
+            full_tokens, _ = self._model.aligner_processor.encode_timestamp(full_text, language)
+        if [token for tokens in token_lists for token in tokens] != list(full_tokens):
+            raise forced.AlignmentInputError(
+                "Region boundaries change canonical token ownership; place text boundaries between complete alignment units"
+            )
+        return token_lists
+
+    def align_standalone(self, audio: str, text: str, language: str) -> list[dict[str, Any]]:
+        self.load(strict=True)
+        with self._infer_lock:
+            with self._processor_lock:
+                # mlx-audio's Model wrapper forwards reads but not assignments.
+                # Install the adapter on the object actually bound to generate.
+                generate = self._model.generate
+                owner = getattr(generate, "__self__", None)
+                if owner is None:
+                    raise forced.AlignmentOutputError("Aligner generate method has no verifiable processor owner")
+                original = owner.aligner_processor
+                raw_processor = _RawTimestampProcessor(original)
+                owner.aligner_processor = raw_processor
+                try:
+                    raw = generate(audio=audio, text=text, language=language)
+                finally:
+                    owner.aligner_processor = original
+        if not raw_processor.parsed:
+            raise forced.AlignmentOutputError("Aligner did not expose raw timestamps; refusing unverifiable timing")
+        segments = getattr(raw, "segments", None)
+        if not isinstance(segments, list) or any(not isinstance(item, dict) for item in segments):
+            raise forced.AlignmentOutputError("Invalid forced-alignment result")
+        # The legacy normalizer clamps timestamps and drops empty tokens. The
+        # standalone path must validate every raw item before any adjustment.
+        return [{"word": item.get("text"), "start": item.get("start"), "end": item.get("end")} for item in segments]
 
 
 SETUP_MODEL_SPECS = (
@@ -3512,6 +3598,7 @@ def _parse_audio_file_payload(audio_spec: Any, payload: dict[str, Any]) -> tuple
 def _transcode_with_ffmpeg(
     input_path: str,
     timeout_seconds: float | None = 20.0,
+    max_duration_seconds: float | None = None,
 ) -> tuple[str | None, str | None]:
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as converted:
         converted_path = converted.name
@@ -3530,6 +3617,7 @@ def _transcode_with_ffmpeg(
         "16000",
         "-c:a",
         "pcm_s16le",
+        *(["-t", str(max_duration_seconds)] if max_duration_seconds is not None else []),
         converted_path,
     ]
     try:
@@ -3598,6 +3686,180 @@ async def _run_blocking_safely(
     finally:
         _CURRENT_CANCELLATION_EVENT.reset(cancellation_token)
         _CURRENT_REQUEST_ID.reset(request_token)
+
+
+def _check_alignment_cancellation() -> None:
+    event = _CURRENT_CANCELLATION_EVENT.get()
+    if event is not None and event.is_set():
+        raise InferenceWaitCancelled("Alignment cancelled between processing stages")
+
+
+def _alignment_path_sync(
+    audio_path: str,
+    alignment_request: forced.AlignmentRequest,
+    ffmpeg_timeout_seconds: float | None,
+) -> forced.AlignmentResult:
+    source = Path(audio_path)
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise forced.AlignmentInputError("Audio must be a nonempty regular local file")
+    language = _to_language_code(alignment_request.language)
+    if language not in LANGUAGE_CODE_TO_NAME:
+        raise forced.AlignmentInputError("Unsupported alignment language; use a supported language code or name")
+    missing = _alignment_dependency_missing(language)
+    if missing:
+        raise forced.AlignmentInputError(missing)
+    language_name = LANGUAGE_CODE_TO_NAME[language]
+    converted_path = None
+    _check_alignment_cancellation()
+    try:
+        if _is_standard_pcm16_mono_16k_wav_path(audio_path):
+            prepared_path = audio_path
+        else:
+            converted_path, error = _transcode_with_ffmpeg(
+                audio_path, ffmpeg_timeout_seconds, forced.MAX_SOURCE_SECONDS + 1
+            )
+            if converted_path is None:
+                raise forced.AlignmentInputError(f"Audio decoding failed: {error}")
+            prepared_path = converted_path
+        _check_alignment_cancellation()
+        with wave.open(prepared_path, "rb") as source_wav:
+            frame_count = source_wav.getnframes()
+            windows = forced.plan_windows(alignment_request, frame_count)
+            # A WAV header can claim frames that are absent from a truncated file.
+            # Verify its final frame even when regions use only earlier speech.
+            source_wav.setpos(frame_count - 1)
+            if len(source_wav.readframes(1)) != 2:
+                raise forced.AlignmentInputError("Source audio is truncated before its declared end")
+            texts = [alignment_request.text[w.text_start:w.text_end] for w in windows]
+            token_lists = aligner.prepare_standalone(texts, alignment_request.text, language_name)
+            spans = [forced.source_spans(text, tokens) for text, tokens in zip(texts, token_lists)]
+            _check_alignment_cancellation()
+            words: list[dict[str, Any]] = []
+            segments: list[dict[str, Any]] = []
+            region_results: list[dict[str, Any]] = []
+            adjustments: list[dict[str, Any]] = []
+            for index, (window, text, tokens, token_spans) in enumerate(zip(windows, texts, token_lists, spans)):
+                _check_alignment_cancellation()
+                with tempfile.TemporaryDirectory(prefix="qwen-align-") as temp_dir:
+                    region_path = str(Path(temp_dir) / "region.wav")
+                    source_wav.setpos(window.start_frame)
+                    sample_count = window.end_frame - window.start_frame
+                    frames = source_wav.readframes(sample_count)
+                    if len(frames) != sample_count * 2:
+                        raise forced.AlignmentInputError(f"Source audio is truncated in region {index}")
+                    with wave.open(region_path, "wb") as region_wav:
+                        region_wav.setparams((1, 2, forced.SAMPLE_RATE, 0, "NONE", "not compressed"))
+                        region_wav.writeframes(frames)
+                    raw = aligner.align_standalone(region_path, text, language_name)
+                _check_alignment_cancellation()
+                window_duration = sample_count / forced.SAMPLE_RATE
+                local_words, local_adjustments = forced.validate_words(raw, tokens, window_duration)
+
+                def global_time(value: float) -> float:
+                    # Keep an adjusted endpoint exactly on its sample-derived bound;
+                    # summing two floats can otherwise place it one ulp past the end.
+                    return window.end if value == window_duration else window.start + value
+
+                word_offset = len(words)
+                for word, (start, end), token in zip(local_words, token_spans, tokens):
+                    word.update(word=text[start:end], alignment_token=token, text_start=start, text_end=end, region_index=index)
+                local_segments = forced.build_segments(text, local_words, _sentence_candidate_ends(text), index)
+                for word in local_words:
+                    word["start"] = global_time(word["start"])
+                    word["end"] = global_time(word["end"])
+                    word["text_start"] += window.text_start
+                    word["text_end"] += window.text_start
+                for segment in local_segments:
+                    segment["id"] = len(segments)
+                    segment["start"] = global_time(segment["start"])
+                    segment["end"] = global_time(segment["end"])
+                    segment["text_start"] += window.text_start
+                    segment["text_end"] += window.text_start
+                    segment["word_start"] += word_offset
+                    segment["word_end"] += word_offset
+                    segments.append(segment)
+                for adjustment in local_adjustments:
+                    adjustment["word_index"] += word_offset
+                    adjustment["region_index"] = index
+                    adjustment["original"] += window.start
+                    adjustment["adjusted"] = global_time(adjustment["adjusted"])
+                    adjustments.append(adjustment)
+                words.extend(local_words)
+                region_results.append({
+                    "id": index, "start": window.start, "end": window.end,
+                    "start_frame": window.start_frame, "end_frame": window.end_frame,
+                    "text_start": window.text_start, "text_end": window.text_end,
+                    "word_start": word_offset, "word_end": len(words),
+                })
+        if "".join(segment["text"] for segment in segments) != alignment_request.text:
+            raise forced.AlignmentOutputError("Stitched segment coverage differs from the authoritative transcript")
+        if any(
+            right["start"] < left["start"] or right["end"] < left["end"]
+            or (right["region_index"] != left["region_index"] and right["start"] < left["end"])
+            for left, right in zip(words, words[1:])
+        ):
+            raise forced.AlignmentOutputError("Stitched timestamps are backward or overlapping")
+        return forced.AlignmentResult(
+            text=alignment_request.text, language=language,
+            duration=frame_count / forced.SAMPLE_RATE,
+            words=words, segments=segments, regions=region_results,
+            diagnostics={
+                "structural_coverage_verified": True,
+                "acoustic_accuracy_verified": False,
+                "canonical_token_count": len(words),
+                "zero_duration_word_indices": [i for i, word in enumerate(words) if word["timing_status"] == "zero_duration"],
+                "boundary_adjustments": adjustments,
+                "overlapping_word_indices": [i for i in range(1, len(words)) if words[i]["start"] < words[i - 1]["end"]],
+                "timestamp_resolution_seconds": forced.TIMESTAMP_RESOLUTION_SECONDS,
+                "sample_rate": forced.SAMPLE_RATE,
+            },
+        )
+    except (forced.AlignmentInputError, forced.AlignmentOutputError, wave.Error, EOFError, InferenceWaitCancelled):
+        raise
+    except Exception as exc:
+        # The cancellation wrapper logs worker errors, so remove upstream exception
+        # values (which can include transcript contents) before crossing that boundary.
+        raise RuntimeError(f"Standalone alignment execution failed ({type(exc).__name__})") from exc
+    finally:
+        if converted_path:
+            Path(converted_path).unlink(missing_ok=True)
+
+
+async def _run_alignment_path_pipeline(
+    *, request_id: str, audio_path: str, alignment_request: forced.AlignmentRequest,
+    ffmpeg_timeout_seconds: float | None = None,
+) -> forced.AlignmentResult:
+    try:
+        return await _run_blocking_safely(
+            request_id, _alignment_path_sync, audio_path, alignment_request, ffmpeg_timeout_seconds
+        )
+    except (forced.AlignmentInputError, wave.Error, EOFError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except forced.AlignmentOutputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Model/tokenizer exceptions can contain user text; never log their values.
+        logger.error("[%s] Standalone alignment failed (%s)", request_id, type(exc).__name__)
+        raise HTTPException(status_code=503, detail=f"Aligner unavailable or execution failed ({type(exc).__name__}); check model assets and dependencies") from exc
+
+
+def _alignment_output(result: forced.AlignmentResult, response_format: str) -> dict[str, Any] | str:
+    timestamp = _format_vtt_timestamp if response_format == "vtt" else _format_srt_timestamp
+    return forced.output(result, response_format, timestamp)
+
+
+def _build_alignment_response(result: forced.AlignmentResult, response_format: str) -> Response:
+    try:
+        output = _alignment_output(result, response_format)
+    except forced.AlignmentInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except forced.AlignmentOutputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if isinstance(output, dict):
+        return JSONResponse(content=output)
+    return PlainTextResponse(content=output, media_type="text/vtt" if response_format == "vtt" else "text/plain")
 
 
 async def _run_transcription_path_pipeline(
@@ -3964,6 +4226,8 @@ async def _run_transcription_pipeline(
 
 
 _ADMISSION_PATHS = {
+    "/v1/audio/alignments",
+    "/audio/alignments",
     "/v1/audio/transcriptions",
     "/audio/transcriptions",
     "/v1/chat/completions",
@@ -3972,7 +4236,7 @@ _ADMISSION_PATHS = {
 
 
 class AdmissionMetricsMiddleware:
-    """Bound transcription work before request bodies are materialized."""
+    """Bound audio inference work before request bodies are materialized."""
 
     def __init__(self, app: Any, metrics: RuntimeMetrics) -> None:
         self.app = app
@@ -3994,7 +4258,7 @@ class AdmissionMetricsMiddleware:
                 status_code=429,
                 content={
                     "detail": (
-                        "Transcription admission capacity is full. "
+                        "Audio inference admission capacity is full. "
                         "Retry after an in-flight request completes."
                     )
                 },
@@ -4102,10 +4366,18 @@ def _health_snapshot() -> tuple[dict[str, Any], int]:
     payload = {
         "status": "ok" if ready else "unavailable",
         "live": True,
+        "version": APP_VERSION,
         "ready": ready,
         "components": {
             "model": model_state,
             "aligner": aligner_state,
+            "alignment": {
+                "ready": bool(aligner_state["ready"] and queue_ready),
+                "requires_asr": False,
+                "max_window_seconds": forced.MAX_WINDOW_SECONDS,
+                "max_window_units": forced.MAX_WINDOW_UNITS,
+                "max_window_text_tokens": forced.MAX_WINDOW_TEXT_TOKENS,
+            },
             "queue": queue_state,
         },
         "metrics": metrics,
@@ -4134,6 +4406,43 @@ async def list_models() -> dict[str, Any]:
             for model_id in model_ids
         ],
     }
+
+
+@app.post("/v1/audio/alignments")
+@app.post("/audio/alignments")
+async def alignments(
+    request: Request,
+    file: UploadFile | None = File(default=None),
+    text: str | None = Form(default=None),
+    language: str | None = Form(default=None),
+    response_format: str = Form(default="verbose_json"),
+    regions: str | None = Form(default=None),
+) -> Response:
+    request_id = getattr(request.state, "request_id", None) or uuid.uuid4().hex[:8]
+    try:
+        alignment_request = forced.parse_request(text, language, response_format, regions)
+    except forced.AlignmentInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if file is None:
+        raise HTTPException(status_code=400, detail="Missing required multipart field: file")
+    # Bound the in-memory read even when a client omits Content-Length.
+    audio_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(audio_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large. Max allowed size is {MAX_UPLOAD_MB} MB")
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    lease = getattr(request.state, "admission_lease", None)
+    if lease is not None:
+        lease.set_audio_bytes(len(audio_bytes))
+    with tempfile.TemporaryDirectory(prefix="qwen-alignment-upload-") as temp_dir:
+        audio_path = Path(temp_dir) / "audio"
+        audio_path.write_bytes(audio_bytes)
+        del audio_bytes
+        result = await _run_alignment_path_pipeline(
+            request_id=request_id, audio_path=str(audio_path), alignment_request=alignment_request,
+            ffmpeg_timeout_seconds=20.0,
+        )
+    return _build_alignment_response(result, response_format)
 
 
 @app.post("/v1/audio/transcriptions")
@@ -4471,13 +4780,23 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     )
     transcribe.add_argument("-o", "--output")
     _add_cli_decode_arguments(transcribe)
+
+    align = subparsers.add_parser("align", help="Align an authoritative transcript without ASR (30 seconds per region)")
+    align.add_argument("audio", help="Local audio/video file; no HTTP upload cap")
+    text_group = align.add_mutually_exclusive_group(required=True)
+    text_group.add_argument("--text-file", help="UTF-8 authoritative transcript; exact Unicode offsets")
+    text_group.add_argument("--text", help="Authoritative transcript text")
+    align.add_argument("--language", required=True, help="Aligner language code or name; no automatic detection")
+    align.add_argument("--regions-file", help="UTF-8 JSON array of audio/text regions for longer sources")
+    align.add_argument("--response-format", choices=sorted(forced.RESPONSE_FORMATS), default="verbose_json")
+    align.add_argument("-o", "--output", help="Atomic output file; defaults to stdout")
     return parser
 
 
 def _normalized_cli_argv(argv: list[str]) -> list[str]:
     if not argv:
         return ["serve"]
-    if argv[0] in {"-h", "--help", "serve", "setup", "transcribe"}:
+    if argv[0] in {"-h", "--help", "serve", "setup", "transcribe", "align"}:
         return argv
     if argv[0].startswith("-"):
         return ["serve", *argv]
@@ -4589,6 +4908,80 @@ def _run_local_transcribe_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _alignment_input_file(value: str, label: str, max_bytes: int | None = None) -> Path:
+    try:
+        path = Path(value).expanduser().resolve()
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise forced.AlignmentInputError(f"{label} must be a nonempty regular file")
+        if max_bytes is not None and path.stat().st_size > max_bytes:
+            raise forced.AlignmentInputError(f"{label} exceeds its input size limit")
+    except (OSError, RuntimeError, ValueError) as exc:
+        if isinstance(exc, forced.AlignmentInputError):
+            raise
+        raise forced.AlignmentInputError(f"{label} file is unavailable") from exc
+    return path
+
+
+def _protect_alignment_sources(output: str | None, sources: list[Path]) -> None:
+    if output in {None, "-"}:
+        return
+    target = Path(output).expanduser().resolve()
+    for source in sources:
+        if target == source or (target.exists() and target.samefile(source)):
+            raise forced.AlignmentInputError("Output must not overwrite audio, transcript, or regions input, including filesystem aliases")
+
+
+def _serialize_alignment_output(result: forced.AlignmentResult, response_format: str) -> bytes:
+    output = _alignment_output(result, response_format)
+    if isinstance(output, dict):
+        output = json.dumps(output, ensure_ascii=False, allow_nan=False, indent=2) + "\n"
+    return output.encode("utf-8")
+
+
+def _run_local_align_command(args: argparse.Namespace) -> int:
+    try:
+        audio_path = _alignment_input_file(args.audio, "Audio")
+        sources = [audio_path]
+        text = args.text
+        if args.text_file:
+            transcript_path = _alignment_input_file(args.text_file, "Transcript", forced.MAX_TEXT_CHARACTERS * 4)
+            sources.append(transcript_path)
+            # Decode bytes directly: read_text's newline conversion changes offsets.
+            text = transcript_path.read_bytes().decode("utf-8")
+        regions = None
+        if args.regions_file:
+            regions_path = _alignment_input_file(args.regions_file, "Regions", forced.MAX_REGION_JSON_BYTES)
+            sources.append(regions_path)
+            regions = regions_path.read_bytes().decode("utf-8")
+        _protect_alignment_sources(args.output, sources)
+        alignment_request = forced.parse_request(text, args.language, args.response_format, regions)
+        result = asyncio.run(_run_alignment_path_pipeline(
+            request_id=f"align-cli-{uuid.uuid4().hex[:8]}", audio_path=str(audio_path),
+            alignment_request=alignment_request,
+        ))
+        content = _serialize_alignment_output(result, args.response_format)
+        # Recheck aliases after inference and before any output mutation.
+        _protect_alignment_sources(args.output, sources)
+        _emit_cli_output(content, args.output)
+        return 0
+    except (forced.AlignmentInputError, UnicodeError) as exc:
+        message = "Input text/regions must be valid UTF-8" if isinstance(exc, UnicodeError) else str(exc)
+        print(message, file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("Alignment interrupted.", file=sys.stderr)
+        return 130
+    except HTTPException as exc:
+        print(str(exc.detail), file=sys.stderr)
+        return 2 if exc.status_code in {400, 413} else 1
+    except forced.AlignmentOutputError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Local alignment failed ({type(exc).__name__}); output was not replaced.", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     global LOG_PROMPTS
 
@@ -4599,6 +4992,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_setup_wizard(source=args.source, non_interactive=args.non_interactive)
     if args.command == "transcribe":
         return _run_local_transcribe_command(args)
+    if args.command == "align":
+        return _run_local_align_command(args)
 
     if args.log_prompts:
         LOG_PROMPTS = True

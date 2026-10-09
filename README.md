@@ -24,6 +24,34 @@
 - 可选 forced alignment（词级时间戳，基于 Qwen3-ForcedAligner）
 - 支持终端交互式 setup 流程
 
+## Standalone forced alignment (v1.3.0)
+
+Align an existing authoritative transcript without running ASR:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8989/v1/audio/alignments \
+  -F 'file=@recording.wav' -F 'text=<transcript.txt' -F 'language=en'
+
+uv run qwen3-asr-mlx-server align recording.wav \
+  --text-file transcript.txt --language en \
+  --response-format verbose_json --output alignment.json
+```
+
+`/audio/alignments` is an alias. Outputs are `verbose_json` (default), `srt`, or
+`vtt`. The supplied text is preserved exactly; results identify `task=align` and
+forced-alignment provenance. Language is required, and the align-only CLI needs
+only the aligner model. Transcription and Chat APIs retain their existing contracts.
+
+Direct windows support up to 30 seconds, 256 canonical alignment units, and 2048
+encoded text/timestamp tokens. Longer sources require explicit audio/text regions
+through HTTP `regions` or CLI `--regions-file`. No ASR fallback or guessed text
+splits are used. JSON reports zero-duration words and timing diagnostics; structural
+coverage does not establish acoustic accuracy.
+
+See the [full alignment guide](docs/forced-alignment.md) for region schemas,
+Unicode offsets, all resource limits, languages, readiness, error codes, and
+subtitle restrictions. Check it with `scripts/smoke_alignment.sh PORT AUDIO TEXT_FILE LANGUAGE`.
+
 ## 模型策略
 
 本项目仅支持 Qwen3-ASR 的 MLX 命名（全精度与量化版本），例如：
@@ -219,6 +247,8 @@ uv run --python 3.11 qwen3-asr-mlx-server --log-prompts
 - `QWEN_MLX_ALIGNMENT_BOUNDARY_TOLERANCE_SECONDS=0` 可以恢复固定秒数硬切。
 
 ## 说明
+
+The following task, language, and output-format notes describe the transcription APIs; see the standalone alignment guide for `align`.
 
 - 仅支持 `task=transcribe`；`translate` 会被拒绝。
 - 为避免 MLX 原生层在并发下崩溃，单进程内的转录与 forced alignment 推理会串行执行。每个进程允许 1 个执行中的请求和 `QWEN_MLX_MAX_QUEUE_DEPTH` 个 in-flight 等待请求；超出容量时返回 `429` 与 `Retry-After: 1`。
