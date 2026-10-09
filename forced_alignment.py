@@ -284,6 +284,8 @@ def output(result: AlignmentResult, response_format: str, timestamp: Callable[[f
         raise AlignmentOutputError("Zero-duration alignment words cannot be exported as subtitles; use verbose_json to inspect diagnostics")
     lines = ["WEBVTT", ""] if response_format == "vtt" else []
     for index, segment in enumerate(result.segments, 1):
+        if round(segment["end"] * 1000) <= round(segment["start"] * 1000):
+            raise AlignmentOutputError("Subtitle cue collapses at millisecond resolution; use verbose_json to inspect timing")
         content = segment["text"]
         _validate_subtitle_text(content)
         content = html.escape(content, quote=False)

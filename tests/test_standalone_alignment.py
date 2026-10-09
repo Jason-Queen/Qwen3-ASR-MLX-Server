@@ -294,6 +294,16 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaises(forced.AlignmentOutputError):
                 server._alignment_output(result, fmt)
 
+    def test_subtitle_rejects_positive_interval_that_rounds_to_zero(self):
+        make_wav(self.audio, 1 / 16000)
+        self.model.timestamps = [0, 80]
+        result = asyncio.run(self.pipeline("Hello"))
+        self.assertGreater(result.words[0]["end"], result.words[0]["start"])
+        for fmt in ("srt", "vtt"):
+            with self.assertRaises(forced.AlignmentOutputError) as ctx:
+                server._alignment_output(result, fmt)
+            self.assertIn("millisecond", str(ctx.exception))
+
     def test_decoding_failure_and_converted_audio_cleanup(self):
         self.audio.write_bytes(b"compressed")
         converted = Path(self.temp.name) / "converted.wav"
