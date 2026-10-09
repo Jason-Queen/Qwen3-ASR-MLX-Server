@@ -3,7 +3,7 @@ set -euo pipefail
 PORT="${1:-8989}"
 AUDIO="${2:?Usage: smoke_alignment.sh PORT AUDIO TEXT_FILE LANGUAGE}"
 TRANSCRIPT="${3:?Transcript file is required}"
-LANGUAGE="${4:-en}"
+ALIGNMENT_LANGUAGE="${4:-en}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKSPACE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
 ARTIFACT_ROOT="${REPO_ROOT}/artifacts/validation"
@@ -23,7 +23,7 @@ PY
 for FORMAT in verbose_json srt vtt; do
   curl --fail-with-body --silent --show-error "$BASE_URL/v1/audio/alignments" \
     -F "file=@${AUDIO}" -F "text=<${TRANSCRIPT}" \
-    --form-string "language=${LANGUAGE}" --form-string "response_format=${FORMAT}" \
+    --form-string "language=${ALIGNMENT_LANGUAGE}" --form-string "response_format=${FORMAT}" \
     -o "$OUT_DIR/alignment.${FORMAT}"
 done
 python3 - "$OUT_DIR" "$TRANSCRIPT" <<'PY'
@@ -44,7 +44,7 @@ assert (out/'alignment.vtt').read_bytes().startswith(b'WEBVTT\n')
 print(f"Alignment smoke passed: {len(p['words'])} words, {len(p['segments'])} segments")
 PY
 STATUS="$(curl --silent --show-error "$BASE_URL/audio/alignments" \
-  -F "file=@${AUDIO}" -F "text=<${TRANSCRIPT}" --form-string "language=${LANGUAGE}" \
+  -F "file=@${AUDIO}" -F "text=<${TRANSCRIPT}" --form-string "language=${ALIGNMENT_LANGUAGE}" \
   -F 'response_format=json' -o "$OUT_DIR/invalid-format.json" -w '%{http_code}')"
 [[ "$STATUS" == "400" ]]
 echo "Evidence saved to $OUT_DIR"
