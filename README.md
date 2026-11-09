@@ -24,9 +24,9 @@
 - 可选 forced alignment（词级时间戳，基于 Qwen3-ForcedAligner）
 - 支持终端交互式 setup 流程
 
-## Standalone forced alignment (v1.3.0)
+## 独立强制对齐（v1.3.0）
 
-Align an existing authoritative transcript without running ASR:
+使用已有的准确转录文本直接对齐音频，无需运行语音识别：
 
 ```bash
 curl --fail-with-body http://127.0.0.1:8989/v1/audio/alignments \
@@ -37,20 +37,18 @@ uv run qwen3-asr-mlx-server align recording.wav \
   --response-format verbose_json --output alignment.json
 ```
 
-`/audio/alignments` is an alias. Outputs are `verbose_json` (default), `srt`, or
-`vtt`. The supplied text is preserved exactly; results identify `task=align` and
-forced-alignment provenance. Language is required, and the align-only CLI needs
-only the aligner model. Transcription and Chat APIs retain their existing contracts.
+`/audio/alignments` 是别名。支持 `verbose_json`（默认）、`srt` 和 `vtt` 输出。
+原文会完整保留；结果包含 `task=align` 和强制对齐的时间戳来源。必须指定语言，
+独立对齐 CLI 仅需对齐模型。转录和 Chat API 保持原有接口约定。
 
-Direct windows support up to 30 seconds, 256 canonical alignment units, and 2048
-encoded text/timestamp tokens. Longer sources require explicit audio/text regions
-through HTTP `regions` or CLI `--regions-file`. No ASR fallback or guessed text
-splits are used. JSON reports zero-duration words and timing diagnostics; structural
-coverage does not establish acoustic accuracy.
+每个直接对齐窗口最多支持 30 秒音频、256 个标准对齐单元和 2048 个编码后的文本/时间戳 token。
+更长的音频需要通过 HTTP `regions` 或 CLI `--regions-file` 显式提供音频与文本区间。
+对齐不会回退到语音识别，也不会猜测文本的切分方式。JSON 会报告零时长词和时间诊断；
+结构覆盖验证并不能保证声学对齐的准确性。
 
-See the [full alignment guide](docs/forced-alignment.md) for region schemas,
-Unicode offsets, all resource limits, languages, readiness, error codes, and
-subtitle restrictions. Check it with `scripts/smoke_alignment.sh PORT AUDIO TEXT_FILE LANGUAGE`.
+有关区间格式、Unicode 偏移、完整资源限制、语言支持、就绪状态、错误码和字幕限制，
+请参阅[完整对齐指南（英文）](docs/forced-alignment.md)。可运行
+`scripts/smoke_alignment.sh PORT AUDIO TEXT_FILE LANGUAGE` 进行验证。
 
 ## 模型策略
 
@@ -248,7 +246,7 @@ uv run --python 3.11 qwen3-asr-mlx-server --log-prompts
 
 ## 说明
 
-The following task, language, and output-format notes describe the transcription APIs; see the standalone alignment guide for `align`.
+以下关于任务、语言和输出格式的说明适用于转录 API；`align` 请参阅独立对齐指南。
 
 - 仅支持 `task=transcribe`；`translate` 会被拒绝。
 - 为避免 MLX 原生层在并发下崩溃，单进程内的转录与 forced alignment 推理会串行执行。每个进程允许 1 个执行中的请求和 `QWEN_MLX_MAX_QUEUE_DEPTH` 个 in-flight 等待请求；超出容量时返回 `429` 与 `Retry-After: 1`。
